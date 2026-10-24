@@ -1,0 +1,215 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>双水村 · 3D</title>
+<style>
+  :root{
+    --ink:#f2e6cf; --dim:#c9b48e; --gold:#d9b25e; --red:#a8452f;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:#14100b;color:var(--ink);
+    font-family:"Source Han Serif SC","Noto Serif SC","Songti SC","SimSun",serif;}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+  #c.dragging{cursor:grabbing}
+
+  /* 世界里的地名标签 */
+  #labels{position:fixed;inset:0;pointer-events:none;z-index:4;overflow:hidden}
+  .lbl3d{position:absolute;transform:translate(-50%,-100%);padding:3px 8px 3px 7px;
+    background:rgba(20,15,10,.58);border-left:2px solid #d9b25e;color:#f2e6cf;
+    font-size:12.5px;letter-spacing:.06em;white-space:nowrap;opacity:0;
+    transition:opacity .15s;text-shadow:0 1px 3px #000}
+  .lbl3d i{display:inline-block;width:4px;height:4px;background:#d9b25e;border-radius:50%;
+    margin-right:6px;vertical-align:middle}
+
+  /* 小地图 */
+  #minimap{position:fixed;right:16px;top:16px;width:190px;height:190px;z-index:5;
+    border:1px solid rgba(217,178,94,.5);border-radius:4px;background:rgba(20,15,10,.55);
+    box-shadow:0 6px 24px rgba(0,0,0,.35);opacity:0;transition:opacity .8s}
+  #minimap.on{opacity:1}
+  @media (max-width:520px){
+    #minimap{width:118px;height:118px;right:10px;top:68px}
+  }
+
+  /* 飞天按钮 */
+  .flybtn{position:fixed;left:18px;top:98px;z-index:6;padding:6px 12px;font-family:inherit;
+    font-size:12px;letter-spacing:.2em;color:#f0e2c6;background:rgba(20,15,10,.55);
+    border:1px solid rgba(217,178,94,.5);border-radius:3px;cursor:pointer;
+    opacity:0;transition:opacity .6s,background .2s;pointer-events:none}
+  .flybtn.on{opacity:1;pointer-events:auto}
+  .flybtn.active{background:rgba(217,178,94,.28);border-color:#e8cf98}
+  @media (max-width:520px){ .flybtn{top:70px;left:10px;font-size:11px;padding:5px 9px} }
+
+  /* 顶部 */
+  #hud{position:fixed;left:18px;top:16px;z-index:5;pointer-events:none;
+    text-shadow:0 2px 12px rgba(0,0,0,.55);opacity:0;transition:opacity .8s}
+  #hud.on{opacity:1}
+  .brand{font-size:13px;letter-spacing:.42em;color:var(--dim)}
+  .zone{margin-top:6px;font-size:26px;letter-spacing:.18em;color:var(--ink)}
+  .zone small{font-size:11px;letter-spacing:.2em;color:var(--dim);margin-left:10px}
+
+  /* 底部提示 */
+  #hint{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:5;
+    display:flex;gap:14px;align-items:center;white-space:nowrap;
+    background:rgba(18,14,10,.42);border:1px solid rgba(217,178,94,.22);
+    padding:8px 16px;border-radius:30px;font-size:12px;color:#e6d6b8;
+    backdrop-filter:blur(6px);opacity:0;transition:opacity .6s;pointer-events:none}
+  #hint.on{opacity:1}
+  #hint b{color:var(--gold);font-weight:600;letter-spacing:.06em}
+  #hint span{color:#a99471}
+
+  /* 互动提示 */
+  #prompt{position:fixed;left:50%;bottom:86px;transform:translateX(-50%);z-index:6;
+    display:flex;align-items:center;gap:9px;padding:8px 16px 8px 10px;
+    background:rgba(18,14,10,.62);border:1px solid rgba(217,178,94,.45);
+    border-radius:4px;font-size:13px;color:#f0e2c6;opacity:0;transition:opacity .2s;pointer-events:none}
+  #prompt.on{opacity:1}
+  #prompt kbd{display:inline-block;min-width:22px;text-align:center;padding:2px 6px;
+    border:1px solid var(--gold);border-radius:3px;color:var(--gold);font:12px/1.4 inherit}
+
+  /* 浮字 */
+  #toast{position:fixed;left:50%;bottom:132px;transform:translateX(-50%) translateY(8px);z-index:7;
+    padding:9px 18px;background:rgba(18,14,10,.66);border-left:2px solid var(--gold);
+    color:#f3e7cd;font-size:14px;letter-spacing:.05em;opacity:0;
+    transition:opacity .35s,transform .35s;pointer-events:none;max-width:80vw;text-align:center}
+  #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  /* 开场 */
+  #start{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+    background:
+      radial-gradient(130% 100% at 50% 30%,rgba(16,12,8,0) 38%,rgba(16,12,8,.62) 100%),
+      linear-gradient(to bottom,rgba(16,12,8,0) 40%,rgba(16,12,8,.55));
+    transition:opacity .9s}
+  #start.out{opacity:0;pointer-events:none}
+  .start-inner{text-align:center;padding:24px;max-width:640px}
+  .kicker{font-size:11px;letter-spacing:.5em;color:var(--dim)}
+  .start-inner h1{margin:16px 0 6px;font-size:clamp(56px,13vw,104px);font-weight:600;
+    letter-spacing:.16em;line-height:1;text-shadow:0 4px 40px rgba(0,0,0,.5)}
+  .lead{margin:14px 0 26px;font-size:13px;letter-spacing:.16em;color:#cbb897}
+  .keys{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-bottom:30px;
+    font-size:12px;color:#bda883}
+  .keys b{display:inline-block;color:var(--gold);border:1px solid rgba(217,178,94,.45);
+    padding:4px 9px;border-radius:3px;margin-right:6px;font-weight:500}
+  #enter{font-family:inherit;font-size:16px;letter-spacing:.34em;color:#1c150e;
+    background:linear-gradient(#e8cf98,#d3ae63);border:none;padding:13px 42px 13px 46px;
+    border-radius:2px;cursor:pointer;box-shadow:0 10px 30px rgba(0,0,0,.35);transition:transform .15s}
+  #enter:hover{transform:translateY(-2px)}
+  .tip{margin-top:22px;font-size:10.5px;letter-spacing:.22em;color:#8e7c60}
+
+  /* 手机摇杆 */
+  #joy{position:fixed;left:0;bottom:0;width:46%;height:38%;z-index:8;display:none;touch-action:none}
+  #joy .base{position:absolute;width:112px;height:112px;border-radius:50%;
+    border:1px solid rgba(217,178,94,.35);background:rgba(18,14,10,.18);
+    left:24px;bottom:28px;transition:opacity .2s}
+  #joy .knob{position:absolute;width:46px;height:46px;border-radius:50%;
+    background:rgba(224,196,130,.55);border:1px solid rgba(255,236,190,.7);
+    left:33px;top:33px}
+  #actBtn{position:fixed;right:26px;bottom:42px;z-index:8;width:74px;height:74px;border-radius:50%;
+    display:none;background:rgba(18,14,10,.55);border:1px solid rgba(217,178,94,.55);
+    color:#f0e2c6;font-family:inherit;font-size:15px;letter-spacing:.2em;touch-action:none}
+  #actBtn:active{background:rgba(217,178,94,.3)}
+
+  /* 错误 */
+  #err{position:fixed;inset:0;z-index:99;display:none;background:#160f0a;color:#f3d9c0;
+    padding:32px;font:13px/1.8 monospace;white-space:pre-wrap;overflow:auto}
+
+  @media (hover:none) and (pointer:coarse){
+    #joy{display:block}
+    #actBtn{display:block}
+    #hint{display:none}
+  }
+  @media (max-width:520px){
+    .zone{font-size:21px}
+    #hud{left:14px;top:12px}
+  }
+#bball{position:fixed;left:50%;bottom:88px;transform:translateX(-50%);width:min(520px,92vw);background:rgba(24,20,16,.9);color:#f4e8d0;border:1px solid #6b5a41;border-radius:10px;padding:12px 16px;display:none;z-index:30;text-align:center}
+#bball.on{display:block}
+#bball .bb-head{font-size:14px;letter-spacing:2px;color:#e8c98d}
+#bball .bb-score{font-size:14px;margin:6px 0}
+#bball .bb-score b{font-size:26px;color:#ffd27a}
+#bball .bb-bar{height:10px;background:#3a3127;border-radius:5px;overflow:hidden;margin:8px 0}
+#bball .bb-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#c9a45a,#ffd27a)}
+#bball .bb-tip{font-size:12px;color:#cbb894;min-height:16px}
+#bball button{margin-top:8px;background:#8a2f22;color:#f7e9cf;border:0;border-radius:6px;padding:7px 22px;font-size:14px}
+#combat{position:fixed;left:18px;bottom:88px;z-index:7;width:196px;color:#f2e6cf;font-size:12px;background:rgba(22,18,14,.76);border:1px solid #5c4d39;border-radius:8px;padding:8px 10px;display:none}
+#combat.on{display:block}
+#combat .hpwrap{height:8px;background:#3a2f25;border-radius:4px;overflow:hidden}
+#combat .hpwrap i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#8d2f22,#d4663c)}
+#combat .wrow{display:flex;justify-content:space-between;margin-top:5px}
+#combat .wtip{margin-top:4px;color:#b9a98d;font-size:11px}
+#hurt{position:fixed;inset:0;pointer-events:none;z-index:8;background:radial-gradient(circle,rgba(150,20,15,0) 40%,rgba(150,20,15,.55) 100%);opacity:0;transition:opacity .12s}
+#hurt.on{opacity:1}
+#cross{position:fixed;left:50%;top:50%;width:8px;height:8px;margin:-4px 0 0 -4px;border:2px solid rgba(255,230,180,.85);border-radius:50%;z-index:6;display:none}
+#cross.on{display:block}
+#atkBtn{position:fixed;right:22px;bottom:96px;z-index:7;width:64px;height:64px;border-radius:50%;border:1px solid #d9b25e;background:rgba(60,40,24,.82);color:#f4e2bd;font-size:15px;display:none}
+#atkBtn.on{display:block}
+#clock{float:right;color:#e8c98d;font-size:12px;margin-left:8px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="labels"></div>
+<canvas id="minimap" width="240" height="240"></canvas>
+
+<div id="hud">
+  <div class="brand">平 凡 的 世 界 · 一 九 七 五</div>
+  <div class="zone"><span id="zoneName">双水村</span><small id="zoneSub">东拉河</small><span id="clock">16:18</span></div>
+</div>
+
+<button id="flyBtn" class="flybtn">飞 天</button>
+<button id="ballBtn" class="flybtn" style="top:146px">投 篮</button>
+<button id="dayBtn" class="flybtn" style="top:194px">昼 夜</button>
+<button id="musicBtn" class="flybtn" style="top:242px">音 乐</button>
+
+<div id="hint">
+  <span><b>W A S D</b> 走动</span>
+  <span><b>拖动鼠标</b> 看</span>
+  <span><b>Shift</b> 跑</span>
+  <span><b>E</b> 看看</span>
+  <span><b>B</b> 骑车</span>
+  <span><b>滚轮</b> 远近</span>
+</div>
+
+<div id="prompt"><kbd>E</kbd><span id="promptText">看看</span></div>
+<div id="toast"></div>
+
+<div id="joy"><div class="base"><div class="knob" id="knob"></div></div></div>
+<button id="actBtn">看</button>
+
+<div id="start">
+  <div class="start-inner">
+    <div class="kicker">路 遥 · 一 九 七 五</div>
+    <h1>双水村</h1>
+    <p class="lead">沿着东拉河走一走。山、河、窑洞，都在原来的位置。</p>
+    <div class="keys">
+      <span><b>W A S D</b>走动</span>
+      <span><b>拖动鼠标</b>看</span>
+      <span><b>Shift</b>跑</span>
+      <span><b>E</b>看看</span>
+    </div>
+    <button id="enter">进 村</button>
+    <div class="tip">建议全屏 · 戴耳机 · 黄昏时分</div>
+  </div>
+</div>
+
+<div id="err"></div>
+
+<div id="bball">
+  <div class="bb-head">县立中学 · 篮球场</div>
+  <div class="bb-score"><b id="bbScore">0</b> 分 · 第 <span id="bbShot">1</span> / 8 球</div>
+  <div class="bb-bar"><i id="bbPower"></i></div>
+  <div class="bb-tip" id="bbTip">按住空格蓄力，松开投篮 · Esc 退出</div>
+  <button id="bbBtn">按住蓄力</button>
+</div>
+<div id="combat">
+  <div class="hpwrap"><i id="hpBar"></i></div>
+  <div class="wrow"><span id="wpnName">剑</span><span id="ammo"></span></div>
+  <div class="wtip">J 攻击 · 1 剑 · 2 枪 · R 换弹</div>
+</div>
+<div id="hurt"></div>
+<div id="cross"></div>
+<button id="atkBtn">攻 击</button>
+<!--GAME_JS-->
+</body>
+</html>

@@ -1,0 +1,3227 @@
+﻿/* ============================================================
+   双水村 · 3D  —  原生 WebGL，无依赖
+   Part 1: 数学 / 几何 / 渲染器 / 地形 / 水 / 天空
+   ============================================================ */
+(function () {
+'use strict';
+
+const canvas = document.getElementById('c');
+const errEl = document.getElementById('err');
+function fatal(msg) {
+  errEl.style.display = 'block';
+  errEl.textContent = String(msg);
+  console.error(msg);
+}
+window.addEventListener('error', (e) => fatal(e.message + '\n' + (e.error && e.error.stack || '')));
+
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false, powerPreference: 'high-performance' })
+        || canvas.getContext('experimental-webgl', { antialias: true, alpha: false });
+if (!gl) { fatal('这个浏览器不支持 WebGL。请换 Chrome / Edge 打开。'); return; }
+
+/* ---------------- 数学 ---------------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+
+function m4identity() {
+  const o = new Float32Array(16); o[0] = o[5] = o[10] = o[15] = 1; return o;
+}
+function m4mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function m4perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), o = new Float32Array(16);
+  o[0] = f / aspect; o[5] = f; o[10] = (far + near) / (near - far); o[11] = -1;
+  o[14] = (2 * far * near) / (near - far);
+  return o;
+}
+function m4lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz) || 1; zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  const o = new Float32Array(16);
+  o[0] = xx; o[1] = yx; o[2] = zx; o[3] = 0;
+  o[4] = xy; o[5] = yy; o[6] = zy; o[7] = 0;
+  o[8] = xz; o[9] = yz; o[10] = zz; o[11] = 0;
+  o[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+  o[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+  o[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+  o[15] = 1;
+  return o;
+}
+function m4trs(px, py, pz, rx, ry, rz, sx, sy, sz) {
+  const a = Math.cos(rx), b = Math.sin(rx), c = Math.cos(ry), d = Math.sin(ry), e = Math.cos(rz), f = Math.sin(rz);
+  const ae = a * e, af = a * f, be = b * e, bf = b * f;
+  const o = new Float32Array(16);
+  o[0] = c * e * sx; o[1] = (af + be * d) * sx; o[2] = (bf - ae * d) * sx; o[3] = 0;
+  o[4] = -c * f * sy; o[5] = (ae - bf * d) * sy; o[6] = (be + af * d) * sy; o[7] = 0;
+  o[8] = d * sz; o[9] = -b * c * sz; o[10] = a * c * sz; o[11] = 0;
+  o[12] = px; o[13] = py; o[14] = pz; o[15] = 1;
+  return o;
+}
+function m3fromMat4(m) {
+  const o = new Float32Array(9);
+  o[0] = m[0]; o[1] = m[1]; o[2] = m[2];
+  o[3] = m[4]; o[4] = m[5]; o[5] = m[6];
+  o[6] = m[8]; o[7] = m[9]; o[8] = m[10];
+  return o;
+}
+
+/* ---------------- 几何构造 ---------------- */
+const v3 = {
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; }
+};
+
+class Geo {
+  constructor() { this.v = []; }
+  tri(a, b, c, col) { this.triN(a, b, c, v3.norm(v3.cross(v3.sub(b, a), v3.sub(c, a))), col); }
+  triN(a, b, c, n, col) {
+    this.v.push(a[0], a[1], a[2], n[0], n[1], n[2], col[0], col[1], col[2]);
+    this.v.push(b[0], b[1], b[2], n[0], n[1], n[2], col[0], col[1], col[2]);
+    this.v.push(c[0], c[1], c[2], n[0], n[1], n[2], col[0], col[1], col[2]);
+  }
+  triNN(a, b, c, na, nb, nc, col) {
+    this.v.push(a[0], a[1], a[2], na[0], na[1], na[2], col[0], col[1], col[2]);
+    this.v.push(b[0], b[1], b[2], nb[0], nb[1], nb[2], col[0], col[1], col[2]);
+    this.v.push(c[0], c[1], c[2], nc[0], nc[1], nc[2], col[0], col[1], col[2]);
+  }
+  quad(a, b, c, d, col) {
+    const n = v3.norm(v3.cross(v3.sub(b, a), v3.sub(c, a)));
+    this.triN(a, b, c, n, col); this.triN(a, c, d, n, col);
+  }
+  quadN(a, b, c, d, n, col) {
+    this.triN(a, b, c, n, col); this.triN(a, c, d, n, col);
+  }
+  box(cx, cy, cz, sx, sy, sz, col, ry) {
+    ry = ry || 0;
+    const hx = sx / 2, hy = sy / 2, hz = sz / 2;
+    const cs = Math.cos(ry), sn = Math.sin(ry);
+    const P = (x, y, z) => [cx + x * cs + z * sn, cy + y, cz - x * sn + z * cs];
+    const p000 = P(-hx, -hy, -hz), p100 = P(hx, -hy, -hz), p110 = P(hx, hy, -hz), p010 = P(-hx, hy, -hz);
+    const p001 = P(-hx, -hy, hz), p101 = P(hx, -hy, hz), p111 = P(hx, hy, hz), p011 = P(-hx, hy, hz);
+    this.quad(p000, p010, p110, p100, col); // -z
+    this.quad(p001, p101, p111, p011, col); // +z
+    this.quad(p000, p001, p011, p010, col); // -x
+    this.quad(p100, p110, p111, p101, col); // +x
+    this.quad(p000, p100, p101, p001, col); // -y
+    this.quad(p010, p011, p111, p110, col); // +y
+  }
+  cylinder(cx, cy, cz, r, h, col, seg) {
+    seg = seg || 10;
+    for (let i = 0; i < seg; i++) {
+      const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+      const x0 = cx + Math.cos(a0) * r, z0 = cz + Math.sin(a0) * r;
+      const x1 = cx + Math.cos(a1) * r, z1 = cz + Math.sin(a1) * r;
+      this.quad([x0, cy, z0], [x1, cy, z1], [x1, cy + h, z1], [x0, cy + h, z0], col);
+      this.triN([cx, cy + h, cz], [x1, cy + h, z1], [x0, cy + h, z0], [0, 1, 0], col);
+      this.triN([cx, cy, cz], [x0, cy, z0], [x1, cy, z1], [0, -1, 0], col);
+    }
+  }
+  cone(cx, cy, cz, r, h, col, seg) {
+    seg = seg || 9;
+    for (let i = 0; i < seg; i++) {
+      const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+      const x0 = cx + Math.cos(a0) * r, z0 = cz + Math.sin(a0) * r;
+      const x1 = cx + Math.cos(a1) * r, z1 = cz + Math.sin(a1) * r;
+      this.tri([x1, cy, z1], [x0, cy, z0], [cx, cy + h, cz], col);
+      this.triN([cx, cy, cz], [x0, cy, z0], [x1, cy, z1], [0, -1, 0], col);
+    }
+  }
+  sphere(cx, cy, cz, r, col, seg, rings) {
+    seg = seg || 10; rings = rings || 6;
+    for (let j = 0; j < rings; j++) {
+      const p0 = j / rings * Math.PI, p1 = (j + 1) / rings * Math.PI;
+      for (let i = 0; i < seg; i++) {
+        const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+        const P = (p, a) => [cx + r * Math.sin(p) * Math.cos(a), cy + r * Math.cos(p), cz + r * Math.sin(p) * Math.sin(a)];
+        const q0 = P(p0, a0), q1 = P(p0, a1), q2 = P(p1, a1), q3 = P(p1, a0);
+        const n0 = v3.norm([q0[0] - cx, q0[1] - cy, q0[2] - cz]);
+        const n1 = v3.norm([q1[0] - cx, q1[1] - cy, q1[2] - cz]);
+        const n2 = v3.norm([q2[0] - cx, q2[1] - cy, q2[2] - cz]);
+        const n3 = v3.norm([q3[0] - cx, q3[1] - cy, q3[2] - cz]);
+        this.triNN(q0, q1, q2, n0, n1, n2, col);
+        this.triNN(q0, q2, q3, n0, n2, n3, col);
+      }
+    }
+  }
+  /** 山墙屋顶：ridge 沿 z 轴 */
+  roof(cx, baseY, cz, w, h, d, col) {
+    const hw = w / 2, hd = d / 2;
+    const a = [cx - hw, baseY, cz - hd], b = [cx + hw, baseY, cz - hd], c = [cx + hw, baseY, cz + hd], e = [cx - hw, baseY, cz + hd];
+    const r0 = [cx, baseY + h, cz - hd], r1 = [cx, baseY + h, cz + hd];
+    this.quad(a, e, r1, r0, col);      // 西坡
+    this.quad(b, r0, r1, c, col);      // 东坡
+    this.tri(b, a, r0, col);           // 北山墙
+    this.tri(e, c, r1, col);           // 南山墙
+  }
+  /** 竖直圆盘，朝 +x 或 +z */
+  disc(cx, cy, cz, r, col, axis, a0, a1, seg, dir) {
+    axis = axis || 'z'; a0 = a0 === undefined ? 0 : a0; a1 = a1 === undefined ? TAU : a1;
+    seg = seg || 16; dir = dir || 1;
+    for (let i = 0; i < seg; i++) {
+      const t0 = a0 + (a1 - a0) * i / seg, t1 = a0 + (a1 - a0) * (i + 1) / seg;
+      let p0, p1, n;
+      if (axis === 'x') {
+        p0 = [cx, cy + Math.sin(t0) * r, cz + Math.cos(t0) * r];
+        p1 = [cx, cy + Math.sin(t1) * r, cz + Math.cos(t1) * r];
+        n = [dir, 0, 0];
+      } else {
+        p0 = [cx + Math.cos(t0) * r, cy + Math.sin(t0) * r, cz];
+        p1 = [cx + Math.cos(t1) * r, cy + Math.sin(t1) * r, cz];
+        n = [0, 0, 1];
+      }
+      this.triN([cx, cy, cz], p0, p1, n, col);
+    }
+  }
+  discXZ(cx, cy, cz, r, col, seg) {
+    seg = seg || 20;
+    for (let i = 0; i < seg; i++) {
+      const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+      this.triN([cx, cy, cz],
+        [cx + Math.cos(a0) * r, cy, cz + Math.sin(a0) * r],
+        [cx + Math.cos(a1) * r, cy, cz + Math.sin(a1) * r], [0, 1, 0], col);
+    }
+  }
+  build() { return new Float32Array(this.v); }
+}
+
+/* ---------------- 颜色 ---------------- */
+function C(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+const COL = {
+  grass: C('#6c7a42'), dry: C('#a8925f'), dirt: C('#9a7f57'), rock: C('#8a7a63'),
+  bed: C('#6f6752'), road: C('#b9a37c'), rut: C('#97815c'),
+  earth: C('#b08a5e'), earthDark: C('#8e6c47'), stone: C('#8d7d66'), stoneDark: C('#6f6350'), stoneLight: C('#b5a68d'),
+  brick: C('#a4573f'), brickDark: C('#7f402e'), tile: C('#5a4c3e'), wood: C('#5c3d26'),
+  woodDark: C('#3f2b1b'), paper: C('#d8b26a'), dark: C('#241c14'),
+  temple: C('#a8482f'), templeDark: C('#742e1e'), roofTemple: C('#4b4037'),
+  trunk: C('#5b4430'), leaf1: C('#5a7839'), leaf2: C('#6d8c45'), leaf3: C('#4c692f'),
+  wheat: C('#a8944e'), corn: C('#5d7033'), water: C('#3f7d80'),
+  red: C('#a33b28'), white: C('#ded5be'), cloth: C('#3f5666')
+};
+
+/* ---------------- 地形 ---------------- */
+function hash2(x, z) { const n = Math.sin(x * 127.1 + z * 311.7) * 43758.5453; return n - Math.floor(n); }
+function noise2(x, z) {
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), w = zf * zf * (3 - 2 * zf);
+  const a = hash2(xi, zi), b = hash2(xi + 1, zi), c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+  return (a * (1 - u) + b * u) * (1 - w) + (c * (1 - u) + d * u) * w;
+}
+function riverX(z) { return 10 * Math.sin(z * 0.028) + 5 * Math.sin(z * 0.009 + 1.2); }
+function creekZ(x) { return 36 + 1.6 * Math.sin(x * 0.05); }
+
+const WATER_Y = -0.85;
+
+const PEAKS = [
+  { a: 0.18, r: 262, h: 30, s: 34 }, { a: 0.62, r: 286, h: 26, s: 30 },
+  { a: 1.02, r: 250, h: 24, s: 28 }, { a: 1.52, r: 272, h: 34, s: 36 },
+  { a: 1.98, r: 258, h: 28, s: 30 }, { a: 2.42, r: 288, h: 24, s: 32 },
+  { a: 2.86, r: 248, h: 30, s: 30 }, { a: 3.30, r: 276, h: 36, s: 38 },
+  { a: 3.74, r: 252, h: 26, s: 28 }, { a: 4.18, r: 284, h: 30, s: 34 },
+  { a: 4.62, r: 246, h: 22, s: 26 }, { a: 5.06, r: 274, h: 32, s: 36 },
+  { a: 5.50, r: 254, h: 26, s: 30 }, { a: 5.94, r: 288, h: 28, s: 32 }
+];
+
+function terrainH(x, z) {
+  if (TOWN_Y != null && x > TOWN_X0 && x < TOWN_X1 && z > 322 && z < 368) return TOWN_Y;
+  let h = 0.45 * Math.sin(x * 0.07) * Math.cos(z * 0.05) + 0.35 * noise2(x * 0.09, z * 0.09);
+
+  const wx = Math.max(0, (-x - 28) / 72);
+  h += 36 * (1 - Math.exp(-wx * wx * 1.4));
+  const ex = Math.max(0, (x - 66) / 84);
+  h += 24 * (1 - Math.exp(-ex * ex * 1.4)) * (0.22 + 0.78 * smoothstep(9, 32, Math.abs(z - creekZ(x))));
+  const nz = Math.max(0, (-z - 100) / 82);
+  h += 30 * (1 - Math.exp(-nz * nz * 1.4)) * smoothstep(18, 55, Math.abs(x - riverX(z)));
+  const sz = Math.max(0, (z - 122) / 72);
+  h += 22 * (1 - Math.exp(-sz * sz * 1.4)) * smoothstep(12, 42, Math.abs(x - riverX(z)));
+  // 庙坪山：放宽、压低，和南边山脊咬在一起
+  const hmx = (x - 48) / 56, hmz = (z - 100) / 50;
+  const hm = hmx * hmx + hmz * hmz;
+  if (hm < 1) h += (15 + 4 * noise2(x * 0.03 + 2, z * 0.03 - 1)) * Math.pow(1 - hm, 1.35);
+
+  // 周围的山：地形本身抬起来的一圈山脊，和地面自然连在一起
+  const rr = Math.hypot(x, z + 10);
+  const ring = smoothstep(205, 252, rr) * (1 - smoothstep(292, 334, rr));
+  if (ring > 0) {
+    let mh = 10 + 7 * noise2(x * 0.014 + 3, z * 0.014 - 5);
+    for (let i = 0; i < PEAKS.length; i++) {
+      const p = PEAKS[i];
+      const px = Math.cos(p.a) * p.r, pz = Math.sin(p.a) * p.r * 0.95 - 8;
+      const ddx = x - px, ddz = z - pz;
+      mh += p.h * Math.exp(-(ddx * ddx + ddz * ddz) / (2 * p.s * p.s));
+    }
+    h += ring * mh;
+  }
+  // 去原西县城的川道：公路两侧压平成一条宽谷
+  const corrT = smoothstep(220, 255, z);
+  const corrD = 1 - smoothstep(34, 62, Math.abs(x - roadX(z)));
+  if (corrT > 0 && corrD > 0) {
+    h = lerp(h, 7.5 + Math.max(0, z - 220) * 0.018, corrT * corrD);
+  }
+
+  const dx = Math.abs(x - riverX(z));
+  const w = 13;
+  if (dx < w) { const t = 1 - dx / w; h -= t * t * 2.4; }
+
+  if (x > 4 && x < 158) {
+    const dd = Math.abs(z - creekZ(x));
+    if (dd < 6.5) { const t = 1 - dd / 6.5; h -= t * t * 2.0; }
+  }
+
+  return h;
+}
+
+function groundH(x, z) {
+  if (TOWN_Y != null && x > TOWN_X0 && x < TOWN_X1 && z > 322 && z < 368) return TOWN_Y;
+  let h = terrainH(x, z);
+  // 过河石
+  if (Math.abs(z - 14) < 1.8 && Math.abs(x - riverX(14)) < 6.5) h = Math.max(h, -0.55);
+  // 哭咽河口漫水石
+  if (Math.abs(x - 30) < 1.5 && Math.abs(z - creekZ(30)) < 7.8) h = Math.max(h, 0.5);
+  return h;
+}
+
+function terrainNormal(x, z) {
+  const e = 0.9;
+  const hl = terrainH(x - e, z), hr = terrainH(x + e, z);
+  const hd = terrainH(x, z - e), hu = terrainH(x, z + e);
+  return v3.norm([hl - hr, 2 * e, hd - hu]);
+}
+function terrainColor(x, z, h, ny) {
+  const patch = noise2(x * 0.035 + 1.7, z * 0.035 + 4.2);
+  const detail = noise2(x * 0.22 + 9.1, z * 0.22 + 2.3);
+  const slope = 1 - ny;
+  let r, g, b;
+  if (h < WATER_Y - 0.12) { r = 0.38; g = 0.36; b = 0.30; }
+  else if (h < WATER_Y + 0.55) { r = 0.56; g = 0.50; b = 0.38; }
+  else if (slope > 0.5) { r = 0.50; g = 0.44; b = 0.35; }
+  else if (slope > 0.26) { r = 0.60; g = 0.52; b = 0.37; }
+  else {
+    const dry = clamp(0.18 + 0.72 * patch + (detail - 0.5) * 0.34, 0, 1);
+    r = lerp(COL.grass[0], COL.dry[0], dry);
+    g = lerp(COL.grass[1], COL.dry[1], dry);
+    b = lerp(COL.grass[2], COL.dry[2], dry);
+    // 河边的草更绿
+    const wet = 1 - smoothstep(13, 28, Math.abs(x - riverX(z)));
+    r = lerp(r, 0.34, wet * 0.28); g = lerp(g, 0.43, wet * 0.28); b = lerp(b, 0.22, wet * 0.2);
+    // 村子附近的土
+    const dv = Math.hypot(x + 42, z - 10);
+    const village = 1 - smoothstep(16, 42, dv);
+    r = lerp(r, 0.58, village * 0.45); g = lerp(g, 0.49, village * 0.45); b = lerp(b, 0.36, village * 0.45);
+  }
+  const v = 0.9 + 0.2 * noise2(x * 0.6, z * 0.6);
+  return [r * v, g * v, b * v];
+}
+
+/* ---------------- WebGL 初始化 ---------------- */
+const VS = `
+attribute vec3 aPos;
+attribute vec3 aNormal;
+attribute vec3 aColor;
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform mat3 uNMat;
+varying vec3 vN;
+varying vec3 vC;
+varying vec3 vW;
+void main(){
+  vec4 w = uModel * vec4(aPos, 1.0);
+  vW = w.xyz;
+  vN = normalize(uNMat * aNormal);
+  vC = aColor;
+  gl_Position = uVP * w;
+}`;
+
+const FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec3 vN;
+varying vec3 vC;
+varying vec3 vW;
+uniform vec3 uLight;
+uniform vec3 uAmb;
+uniform vec3 uSun;
+uniform vec3 uFog;
+uniform float uFogN;
+uniform float uFogF;
+uniform vec3 uEye;
+uniform float uAlpha;
+uniform float uUnlit;
+void main(){
+  vec3 n = normalize(vN);
+  vec3 col;
+  float f = 0.0;
+  if(uUnlit > 0.5){
+    col = vC;
+  } else {
+    float ndl = max(dot(n, uLight), 0.0);
+    float wrap = max((dot(n, uLight) + 0.42) / 1.42, 0.0);
+    col = vC * (uAmb + uSun * (0.62 * ndl + 0.38 * wrap));
+    float d = distance(vW, uEye);
+    f = smoothstep(uFogN, uFogF, d);
+  }
+  col = mix(col, uFog, f);
+  gl_FragColor = vec4(col, uAlpha);
+}`;
+
+const SKY_VS = `
+attribute vec3 aPos;
+uniform mat4 uVP;
+varying float vY;
+void main(){
+  vY = normalize(aPos).y;
+  gl_Position = uVP * vec4(aPos, 1.0);
+}`;
+const SKY_FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying float vY;
+uniform vec3 uTop;
+uniform vec3 uHor;
+void main(){
+  float t = smoothstep(-0.06, 0.52, vY);
+  vec3 col = mix(uHor, uTop, t);
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+const WATER_VS = `
+attribute vec3 aPos;
+uniform mat4 uVP;
+varying vec3 vW;
+void main(){
+  vW = aPos;
+  gl_Position = uVP * vec4(aPos, 1.0);
+}`;
+const WATER_FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec3 vW;
+uniform float uTime;
+uniform vec3 uEye;
+uniform vec3 uFog;
+uniform float uFogN;
+uniform float uFogF;
+void main(){
+  float w1 = sin(vW.x * 0.55 + uTime * 1.35) * 0.5 + 0.5;
+  float w2 = sin(vW.z * 0.72 - uTime * 1.05 + sin(vW.x * 0.18) * 2.0) * 0.5 + 0.5;
+  vec3 deep = vec3(0.16, 0.33, 0.36);
+  vec3 lite = vec3(0.52, 0.75, 0.74);
+  vec3 col = mix(deep, lite, w1 * 0.42 + w2 * 0.34);
+  vec3 V = normalize(uEye - vW);
+  float fres = pow(1.0 - max(V.y, 0.0), 3.0);
+  col = mix(col, vec3(0.96, 0.82, 0.60), fres * 0.55);
+  float d = distance(vW, uEye);
+  col = mix(col, uFog, smoothstep(uFogN, uFogF, d));
+  gl_FragColor = vec4(col, 0.94);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error('Shader compile error:\n' + gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+function makeProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('Program link error:\n' + gl.getProgramInfoLog(p));
+  return p;
+}
+
+const prog = makeProgram(VS, FS);
+const skyProg = makeProgram(SKY_VS, SKY_FS);
+const waterProg = makeProgram(WATER_VS, WATER_FS);
+
+const L = {
+  aPos: gl.getAttribLocation(prog, 'aPos'),
+  aNormal: gl.getAttribLocation(prog, 'aNormal'),
+  aColor: gl.getAttribLocation(prog, 'aColor'),
+  uVP: gl.getUniformLocation(prog, 'uVP'),
+  uModel: gl.getUniformLocation(prog, 'uModel'),
+  uNMat: gl.getUniformLocation(prog, 'uNMat'),
+  uLight: gl.getUniformLocation(prog, 'uLight'),
+  uAmb: gl.getUniformLocation(prog, 'uAmb'),
+  uSun: gl.getUniformLocation(prog, 'uSun'),
+  uFog: gl.getUniformLocation(prog, 'uFog'),
+  uFogN: gl.getUniformLocation(prog, 'uFogN'),
+  uFogF: gl.getUniformLocation(prog, 'uFogF'),
+  uEye: gl.getUniformLocation(prog, 'uEye'),
+  uAlpha: gl.getUniformLocation(prog, 'uAlpha'),
+  uUnlit: gl.getUniformLocation(prog, 'uUnlit')
+};
+const LS = {
+  aPos: gl.getAttribLocation(skyProg, 'aPos'),
+  uVP: gl.getUniformLocation(skyProg, 'uVP'),
+  uTop: gl.getUniformLocation(skyProg, 'uTop'),
+  uHor: gl.getUniformLocation(skyProg, 'uHor')
+};
+const LW = {
+  aPos: gl.getAttribLocation(waterProg, 'aPos'),
+  uVP: gl.getUniformLocation(waterProg, 'uVP'),
+  uTime: gl.getUniformLocation(waterProg, 'uTime'),
+  uEye: gl.getUniformLocation(waterProg, 'uEye'),
+  uFog: gl.getUniformLocation(waterProg, 'uFog'),
+  uFogN: gl.getUniformLocation(waterProg, 'uFogN'),
+  uFogF: gl.getUniformLocation(waterProg, 'uFogF')
+};
+
+gl.enableVertexAttribArray(L.aPos);
+gl.enableVertexAttribArray(L.aNormal);
+gl.enableVertexAttribArray(L.aColor);
+if (LS.aPos >= 0) gl.enableVertexAttribArray(LS.aPos);
+if (LW.aPos >= 0) gl.enableVertexAttribArray(LW.aPos);
+gl.disable(gl.CULL_FACE);
+
+let FOG = [0.90, 0.76, 0.58];
+const FOG_NEAR = 130, FOG_FAR = 520;
+let SUN_DIR = v3.norm([-0.58, 0.34, 0.38]);
+let AMB = [0.60, 0.60, 0.63];
+let SUN_COL = [1.02, 0.88, 0.68];
+let SKY_TOP = [0.30, 0.47, 0.66], SKY_HOR = [0.93, 0.78, 0.60];
+let dayTime = 16.3;
+var dayCycle = true;
+
+let worldMesh = null, terrainMesh = null, waterMesh = null, skyMesh = null;
+const world = new Geo();
+const colliders = [];
+const pois = [];
+const landmarks = [];
+
+function upload(geo) {
+  const data = geo.build();
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  return { buf: buf, count: data.length / 9 };
+}
+
+function bindMesh(m) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+  gl.vertexAttribPointer(L.aPos, 3, gl.FLOAT, false, 36, 0);
+  gl.vertexAttribPointer(L.aNormal, 3, gl.FLOAT, false, 36, 12);
+  gl.vertexAttribPointer(L.aColor, 3, gl.FLOAT, false, 36, 24);
+}
+function drawMesh(m, model, unlit, alpha) {
+  gl.uniformMatrix4fv(L.uModel, false, model);
+  gl.uniformMatrix3fv(L.uNMat, false, m3fromMat4(model));
+  gl.uniform1f(L.uUnlit, unlit ? 1 : 0);
+  gl.uniform1f(L.uAlpha, alpha === undefined ? 1 : alpha);
+  bindMesh(m);
+  gl.drawArrays(gl.TRIANGLES, 0, m.count);
+}
+
+/* ---------------- 地形网格 ---------------- */
+function buildTerrainMesh() {
+  const X0 = -340, X1 = 340, Z0 = -340, Z1 = 480, STEP = 3.6;
+  const nx = Math.floor((X1 - X0) / STEP), nz = Math.floor((Z1 - Z0) / STEP);
+  const data = new Float32Array(nx * nz * 6 * 9);
+  let p = 0;
+  const push = (x, y, z, n, c) => {
+    data[p++] = x; data[p++] = y; data[p++] = z;
+    data[p++] = n[0]; data[p++] = n[1]; data[p++] = n[2];
+    data[p++] = c[0]; data[p++] = c[1]; data[p++] = c[2];
+  };
+  const hs = new Float32Array((nx + 1) * (nz + 1));
+  for (let j = 0; j <= nz; j++) for (let i = 0; i <= nx; i++) hs[j * (nx + 1) + i] = terrainH(X0 + i * STEP, Z0 + j * STEP);
+
+  for (let j = 0; j < nz; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x0 = X0 + i * STEP, x1 = x0 + STEP;
+      const z0 = Z0 + j * STEP, z1 = z0 + STEP;
+      const h00 = hs[j * (nx + 1) + i], h10 = hs[j * (nx + 1) + i + 1];
+      const h01 = hs[(j + 1) * (nx + 1) + i], h11 = hs[(j + 1) * (nx + 1) + i + 1];
+      const n00 = terrainNormal(x0, z0), n10 = terrainNormal(x1, z0);
+      const n01 = terrainNormal(x0, z1), n11 = terrainNormal(x1, z1);
+      const c00 = terrainColor(x0, z0, h00, n00[1]), c10 = terrainColor(x1, z0, h10, n10[1]);
+      const c01 = terrainColor(x0, z1, h01, n01[1]), c11 = terrainColor(x1, z1, h11, n11[1]);
+      push(x0, h00, z0, n00, c00); push(x0, h01, z1, n01, c01); push(x1, h11, z1, n11, c11);
+      push(x0, h00, z0, n00, c00); push(x1, h11, z1, n11, c11); push(x1, h10, z0, n10, c10);
+    }
+  }
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  return { buf: buf, count: data.length / 9 };
+}
+
+/* ---------------- 水面 ---------------- */
+function ribbonGeo(g, points, halfW, y, col) {
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    const dx = b[0] - a[0], dz = b[1] - a[1];
+    const l = Math.hypot(dx, dz) || 1;
+    const nx = -dz / l * halfW, nz = dx / l * halfW;
+    const a0 = [a[0] - nx, y, a[1] - nz], a1 = [a[0] + nx, y, a[1] + nz];
+    const b0 = [b[0] - nx, y, b[1] - nz], b1 = [b[0] + nx, y, b[1] + nz];
+    g.quadN(a0, b0, b1, a1, [0, 1, 0], col);
+  }
+}
+function buildWaterMesh() {
+  const g = new Geo();
+  const col = [0.5, 0.7, 0.7];
+  const pts1 = [];
+  for (let z = -195; z <= 180; z += 4) pts1.push([riverX(z), z]);
+  ribbonGeo(g, pts1, 9, WATER_Y, col);
+  const pts2 = [];
+  for (let x = 112; x >= 8; x -= 4) pts2.push([x, creekZ(x)]);
+  ribbonGeo(g, pts2, 6.2, WATER_Y, col);
+  const data = g.build();
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  return { buf: buf, count: data.length / 9, geo: g };
+}
+
+/* ---------------- 天空 ---------------- */
+function buildSkyMesh() {
+  const g = new Geo();
+  const R = 760, seg = 28, rings = 14;
+  for (let j = 0; j < rings; j++) {
+    const p0 = j / rings * Math.PI * 0.52, p1 = (j + 1) / rings * Math.PI * 0.52;
+    for (let i = 0; i < seg; i++) {
+      const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+      const P = (p, a) => [R * Math.sin(p) * Math.cos(a), R * Math.cos(p), R * Math.sin(p) * Math.sin(a)];
+      const q0 = P(p0, a0), q1 = P(p0, a1), q2 = P(p1, a1), q3 = P(p1, a0);
+      g.triN(q0, q1, q2, [0, 0, 1], [1, 1, 1]);
+      g.triN(q0, q2, q3, [0, 0, 1], [1, 1, 1]);
+    }
+  }
+  const data = g.build();
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  return { buf: buf, count: data.length / 9 };
+}
+
+/* ============================================================
+   Part 2: 村庄 / 人物 / 操作 / 渲染
+   ============================================================ */
+
+let seed = 1337;
+function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+function roadX(z) { return riverX(z) - 26; }
+function addCollider(x, z, r, tall) { colliders.push({ x: x, z: z, r: r, tall: !!tall }); }
+
+/* ---------------- 路、坝、桥、过河石 ---------------- */
+function buildRoad() {
+  const shoulder = 2.9, surface = 1.9;
+  for (let z = -148; z < 352; z += 4) {
+    const x0 = roadX(z), x1 = roadX(z + 4);
+    const sl0 = [x0 - shoulder, terrainH(x0 - shoulder, z) + 0.05, z];
+    const sr0 = [x0 + shoulder, terrainH(x0 + shoulder, z) + 0.05, z];
+    const sl1 = [x1 - shoulder, terrainH(x1 - shoulder, z + 4) + 0.05, z + 4];
+    const sr1 = [x1 + shoulder, terrainH(x1 + shoulder, z + 4) + 0.05, z + 4];
+    world.quadN(sl0, sl1, sr1, sr0, [0, 1, 0], [0.74, 0.65, 0.49]);
+
+    const l0 = [x0 - surface, terrainH(x0 - surface, z) + 0.08, z];
+    const r0 = [x0 + surface, terrainH(x0 + surface, z) + 0.08, z];
+    const l1 = [x1 - surface, terrainH(x1 - surface, z + 4) + 0.08, z + 4];
+    const r1 = [x1 + surface, terrainH(x1 + surface, z + 4) + 0.08, z + 4];
+    world.quadN(l0, l1, r1, r0, [0, 1, 0], COL.road);
+  }
+  for (let z = -144; z < 349; z += 4) {
+    for (const s of [-1, 1]) {
+      const x0 = roadX(z) + s * 0.92, x1 = roadX(z + 4) + s * 0.92;
+      const a = [x0 - 0.12, terrainH(x0, z) + 0.1, z];
+      const b = [x1 - 0.12, terrainH(x1, z + 4) + 0.1, z + 4];
+      const c = [x1 + 0.12, terrainH(x1, z + 4) + 0.1, z + 4];
+      const d = [x0 + 0.12, terrainH(x0, z) + 0.1, z];
+      world.quadN(a, b, c, d, [0, 1, 0], COL.rut);
+    }
+  }
+  for (let z = -140; z < 345; z += 9) {
+    for (const s of [-1, 1]) {
+      const x = roadX(z) + s * (surface + 0.15);
+      world.box(x, terrainH(x, z) + 0.14, z, 0.45, 0.16, 0.7, COL.stoneLight, s * 0.08);
+    }
+  }
+  for (let z = -120; z < 335; z += 23) {
+    const x = roadX(z) + (rnd() > 0.5 ? 0.6 : -0.6);
+    world.box(x, terrainH(x, z) + 0.09, z, 0.9, 0.02, 0.5, [0.48, 0.42, 0.33], rnd() * 2);
+  }
+}
+
+function buildDamAndBridges() {
+  // 过河石
+  const fz = 14, fx = riverX(fz);
+  for (let i = -3; i <= 3; i++) {
+    world.box(fx + i * 1.75, -0.75, fz + (i % 2) * 0.35, 1.4, 0.5, 1.9, COL.stone);
+  }
+
+  // 哭咽河石桥：在庙前小路上，跨过整条河
+  const bz = creekZ(30);
+  world.box(30, 0.45, bz, 3.0, 0.35, 15.5, COL.stone);
+  world.box(28.6, 0.95, bz, 0.3, 0.9, 15.5, COL.stoneLight);
+  world.box(31.4, 0.95, bz, 0.3, 0.9, 15.5, COL.stoneLight);
+  world.box(30, -0.5, bz - 4.2, 2.4, 1.8, 1.4, COL.stoneDark);
+  world.box(30, -0.5, bz + 4.2, 2.4, 1.8, 1.4, COL.stoneDark);
+  world.box(30, 0.28, bz - 8.4, 3.0, 0.3, 1.4, COL.stone);
+  world.box(30, 0.28, bz + 8.4, 3.0, 0.3, 1.4, COL.stone);
+  wallColliders(28.6, bz - 7.5, 19.6, bz + 7.5, false);
+  wallColliders(31.4, bz - 7.5, 22.4, bz + 7.5, false);
+
+  // 哭咽河大坝（一九七七年修，原文说在哭咽河上、神仙山旁）
+  // 挪到金家湾以东的山口：上游是神仙山，下游才是村子
+  const DX = 100, dz = creekZ(DX), dy = terrainH(DX, dz);
+  const DL = 34;
+  world.box(DX, dy + 1.0, dz, 13, 2.0, DL, COL.earth);
+  world.box(DX, dy + 2.8, dz, 10.5, 1.6, DL, COL.earth);
+  world.box(DX, dy + 4.6, dz, 8.0, 2.0, DL, COL.earth);
+  world.box(DX, dy + 6.3, dz, 5.6, 1.4, DL, COL.earth);
+  // 下游石砌坝面（朝西，正对村子）
+  world.box(DX - 6.4, dy + 3.5, dz, 0.7, 6.6, DL, COL.stone);
+  for (let i = 0; i < 5; i++) {
+    world.box(DX - 6.8, dy + 3.4, dz - 13 + i * 6.5, 0.8, 6.4, 1.2, COL.stoneDark);
+  }
+  // 坝面白石字：高峡出平湖 / 神女应无恙
+  for (let i = 0; i < 5; i++) {
+    world.box(DX - 6.85, dy + 4.7, dz - 4.4 + i * 2.2, 0.1, 0.85, 0.85, [0.93, 0.89, 0.78]);
+    world.box(DX - 6.85, dy + 3.5, dz - 4.4 + i * 2.2, 0.1, 0.85, 0.85, [0.93, 0.89, 0.78]);
+  }
+  // 坝顶
+  world.box(DX, dy + 7.05, dz, 5.6, 0.18, DL, COL.dirt);
+  world.box(DX - 2.7, dy + 7.55, dz, 0.45, 0.8, DL, COL.stone);
+  world.box(DX + 2.7, dy + 7.55, dz, 0.45, 0.8, DL, COL.stone);
+  for (let i = 0; i < 5; i++) {
+    const fz = dz - 13 + i * 6.5;
+    world.cylinder(DX + 0.6, dy + 7.1, fz, 0.06, 2.6, COL.wood, 5);
+    world.box(DX + 1.25, dy + 9.35, fz, 1.15, 0.62, 0.04, COL.red);
+  }
+  // 南端溢洪道 + 闸楼
+  world.box(DX, dy + 1.2, dz + 14.5, 6.2, 2.4, 3.4, COL.stoneDark);
+  world.box(DX, dy + 4.0, dz + 14.5, 3.0, 4.2, 3.0, COL.stone);
+  world.roof(DX, dy + 6.1, dz + 14.5, 4.2, 1.2, 4.2, COL.tile);
+  world.box(DX - 6.4, dy + 3.0, dz + 14.5, 0.6, 3.2, 4.0, COL.stoneDark);
+  // 北端台阶与石碑
+  for (let i = 0; i < 7; i++) {
+    world.box(DX - 5.4 - i * 0.5, dy + 0.4 + i * 0.9, dz - 16.5 + i * 0.2, 1.6, 0.45, 3.0, COL.stone);
+  }
+  world.box(DX - 1.5, dy + 7.6, dz - 15.5, 1.2, 2.4, 1.8, COL.stoneLight);
+  world.roof(DX - 1.5, dy + 8.8, dz - 15.5, 1.8, 0.7, 2.4, COL.tile);
+  // 两端土山，嵌进山嘴
+  world.cone(DX, dy - 2, dz - 20, 9, 10, COL.earthDark, 8);
+  world.cone(DX, dy - 2, dz + 20, 9, 10, COL.earthDark, 8);
+  wallColliders(DX, dz - DL / 2, DX, dz + DL / 2, true);
+  addLandmark('哭咽河大坝', DX - 2, dz, 9.5);
+
+}
+
+/* ---------------- 窑洞 / 房子 / 院墙 ---------------- */
+function cave(x, z, w) {
+  const y = terrainH(x, z) - 0.25;
+  world.box(x - 0.3, y - 0.45, z, 2.8, 1.2, w + 1.0, COL.earth);
+  // 窑脸
+  world.box(x, y + 1.6, z, 0.7, 3.2, w, COL.earth);
+  // 拱顶上的土坡
+  world.box(x - 0.9, y + 3.55, z, 2.6, 1.0, w + 1.4, COL.earth);
+  world.box(x - 2.2, y + 4.0, z, 2.2, 0.8, w + 2.0, COL.earthDark);
+  // 石脚
+  world.box(x + 0.02, y + 0.4, z, 0.8, 0.8, w + 0.3, COL.stone);
+  // 拱门
+  world.box(x + 0.38, y + 1.05, z, 0.06, 2.05, 1.25, COL.dark);
+  world.disc(x + 0.41, y + 2.05, z, 0.64, COL.dark, 'x', 0, Math.PI);
+  // 木门
+  world.box(x + 0.43, y + 1.0, z, 0.05, 2.0, 1.15, COL.wood);
+  world.box(x + 0.46, y + 1.0, z, 0.02, 0.05, 1.0, COL.woodDark);
+  // 窗
+  for (const s of [-1, 1]) {
+    world.box(x + 0.4, y + 1.62, z + s * 1.05, 0.05, 0.55, 0.5, COL.paper);
+    world.box(x + 0.42, y + 1.62, z + s * 1.05, 0.02, 0.5, 0.06, COL.woodDark);
+  }
+  // 台阶与窄平台
+  world.box(x + 1.5, y + 0.15, z, 2.2, 0.35, 1.3, COL.stone);
+  world.box(x + 2.4, y + 0.05, z, 2.0, 0.3, w * 0.55, COL.stone);
+  addCollider(x, z, Math.max(2.4, w * 0.55), true);
+  shadowSpots.push({ x: x + 3.0, z: z - 1.0, rx: 3.6, rz: w * 0.55, a: 0.14 });
+}
+
+function house(x, z, w, d, h, face) {
+  const y = terrainH(x, z) - 0.3;
+  world.box(x, y - 0.5, z, w + 0.5, 1.2, d + 0.5, COL.stone);
+  world.box(x, y + h / 2, z, w, h, d, COL.brick);
+  world.box(x, y + 0.22, z, w + 0.25, 0.45, d + 0.25, COL.stone);
+  world.roof(x, y + h, z, w + 0.9, h * 0.5, d + 0.9, COL.tile);
+  world.box(x + w * 0.28, y + h + h * 0.26, z - d * 0.22, 0.55, 1.1, 0.55, COL.brickDark);
+
+  const alongZ = (face === 'x+' || face === 'x-');
+  const dx = face === 'x+' ? w / 2 + 0.03 : face === 'x-' ? -w / 2 - 0.03 : 0;
+  const dz = face === 'z+' ? d / 2 + 0.03 : face === 'z-' ? -d / 2 - 0.03 : 0;
+  const dw = alongZ ? 1.2 : 0.09, dd = alongZ ? 0.09 : 1.2;
+  world.box(x + dx, y + 1.08, z + dz, dw, 2.15, dd, COL.dark);
+
+  const off = 2.0;
+  if (alongZ) {
+    for (const s of [-1, 1]) {
+      world.box(x + dx, y + 1.62, z + dz + s * off, 0.08, 0.9, 1.0, COL.paper);
+      world.box(x + dx, y + 2.1, z + dz + s * off, 0.1, 0.08, 1.1, COL.wood);
+      world.box(x + dx, y + 1.15, z + dz + s * off, 0.1, 0.08, 1.1, COL.wood);
+    }
+  } else {
+    for (const s of [-1, 1]) {
+      world.box(x + dx + s * off, y + 1.62, z + dz, 1.0, 0.9, 0.08, COL.paper);
+      world.box(x + dx + s * off, y + 2.1, z + dz, 1.1, 0.08, 0.1, COL.wood);
+      world.box(x + dx + s * off, y + 1.15, z + dz, 1.1, 0.08, 0.1, COL.wood);
+    }
+  }
+  addCollider(x, z, Math.hypot(w, d) * 0.55, true);
+  shadowSpots.push({ x: x + 2.4, z: z - 1.4, rx: w * 0.8, rz: d * 0.7, a: 0.16 });
+}
+
+function courtyard(x, z, w, d, h) {
+  h = h || 1.45;
+  const t = 0.32;
+  const gap = 2.8;
+  const yW = terrainH(x - w / 2, z), yE = terrainH(x + w / 2, z);
+  const yN = terrainH(x, z - d / 2);
+  world.box(x - w / 2, yW + h / 2, z, t, h, d, COL.stone);
+  world.box(x + w / 2, yE + h / 2, z, t, h, d, COL.stone);
+  world.box(x, yN + h / 2, z - d / 2, w, h, t, COL.stone);
+  // 南墙留门
+  const segW = (w - gap) / 2;
+  const yS = terrainH(x, z + d / 2);
+  world.box(x - gap / 2 - segW / 2, yS + h / 2, z + d / 2, segW, h, t, COL.stone);
+  world.box(x + gap / 2 + segW / 2, yS + h / 2, z + d / 2, segW, h, t, COL.stone);
+  // 墙体碰撞
+  function seg(x1, z1, x2, z2) {
+    const len = Math.hypot(x2 - x1, z2 - z1);
+    const n = Math.max(1, Math.ceil(len / 1.3));
+    for (let i = 0; i <= n; i++) addCollider(lerp(x1, x2, i / n), lerp(z1, z2, i / n), 0.45);
+  }
+  seg(x - w / 2, z - d / 2, x - w / 2, z + d / 2);
+  seg(x + w / 2, z - d / 2, x + w / 2, z + d / 2);
+  seg(x - w / 2, z - d / 2, x + w / 2, z - d / 2);
+  seg(x - w / 2, z + d / 2, x - gap / 2, z + d / 2);
+  seg(x + gap / 2, z + d / 2, x + w / 2, z + d / 2);
+}
+
+function temple(x, z) {
+  const y = terrainH(x, z);
+  const W = 9.5, D = 6.4, H = 3.0;
+  // 台基、台阶
+  world.box(x, y + 0.4, z, W + 3, 0.8, D + 3, COL.stone);
+  world.box(x, y + 0.82, z, W + 2.2, 0.18, D + 2.2, COL.stoneLight);
+  for (let i = 0; i < 3; i++) {
+    world.box(x, y + 0.2 + i * 0.2, z + D / 2 + 2.3 - i * 0.45, 5.4, 0.25, 0.9, COL.stone);
+  }
+  // 墙、前廊柱
+  world.box(x, y + 0.8 + H / 2, z, W, H, D, COL.temple);
+  for (let i = -2; i <= 2; i++) {
+    world.cylinder(x + i * 2.1, y + 0.8, z + D / 2 + 0.55, 0.2, H, COL.templeDark, 8);
+  }
+  // 门、窗、匾
+  world.box(x, y + 2.3, z + D / 2 + 0.56, 2.5, 3.0, 0.12, COL.dark);
+  world.box(x - 1.3, y + 2.3, z + D / 2 + 0.6, 0.18, 3.0, 0.16, COL.templeDark);
+  world.box(x + 1.3, y + 2.3, z + D / 2 + 0.6, 0.18, 3.0, 0.16, COL.templeDark);
+  for (const s2 of [-1, 1]) {
+    world.box(x + s2 * 3.4, y + 2.5, z + D / 2 + 0.57, 2.0, 1.4, 0.08, COL.paper);
+    world.box(x + s2 * 3.4, y + 2.5, z + D / 2 + 0.6, 0.08, 1.4, 0.05, COL.woodDark);
+    world.box(x + s2 * 3.4, y + 2.5, z + D / 2 + 0.6, 2.0, 0.08, 0.05, COL.woodDark);
+  }
+  world.box(x, y + 0.8 + H - 0.35, z + D / 2 + 0.62, 3.4, 0.7, 0.1, COL.woodDark);
+  for (let i = 0; i < 3; i++) {
+    world.box(x - 1.0 + i * 1.0, y + 0.8 + H - 0.35, z + D / 2 + 0.68, 0.34, 0.34, 0.03, [0.92, 0.86, 0.7]);
+  }
+  // 两重屋顶、翘角、脊饰
+  world.roof(x, y + 0.8 + H, z, W + 2.0, 1.6, D + 2.2, COL.roofTemple);
+  world.roof(x, y + 0.8 + H + 1.25, z, W - 1.6, 0.9, D - 1.0, COL.roofTemple);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    world.cone(x + sx * (W / 2 + 1.0), y + 0.8 + H + 0.4, z + sz * (D / 2 + 1.0), 0.26, 1.2, COL.roofTemple, 5);
+  }
+  world.box(x, y + 0.8 + H + 2.2, z + D / 2 + 0.9, 0.4, 0.5, 0.4, COL.roofTemple);
+  world.box(x, y + 0.8 + H + 2.2, z + D / 2 + 0.9, 0.4, 0.5, 0.4, COL.roofTemple);
+  // 石狮
+  for (const s2 of [-1, 1]) {
+    const lx = x + s2 * 3.9, lz = z + D / 2 + 2.3;
+    world.box(lx, y + 0.25, lz, 1.0, 0.5, 1.0, COL.stoneDark);
+    world.box(lx, y + 0.85, lz, 0.7, 0.9, 0.7, COL.stoneLight);
+    world.box(lx, y + 1.45, lz - 0.1, 0.55, 0.5, 0.55, COL.stoneLight);
+  }
+  // 香炉
+  const fz = z + D / 2 + 3.0;
+  world.cylinder(x, y + 0.8, fz, 0.8, 0.5, COL.stoneLight, 10);
+  world.cone(x, y + 1.3, fz, 0.9, 0.5, COL.stone, 10);
+  for (const s2 of [-1, 0, 1]) world.box(x + s2 * 0.5, y + 0.55, fz + 0.5, 0.12, 0.5, 0.12, COL.stoneDark);
+  // 廊下立一块黑板：大殿已经改成教室
+  world.box(x + 3.8, y + 1.8, z + D / 2 + 1.5, 2.0, 1.2, 0.1, COL.woodDark);
+  world.box(x + 3.8, y + 1.8, z + D / 2 + 1.55, 1.8, 1.0, 0.02, [0.16, 0.2, 0.18]);
+  world.box(x + 3.0, y + 0.9, z + D / 2 + 1.5, 0.08, 1.8, 0.08, COL.wood);
+  world.box(x + 4.6, y + 0.9, z + D / 2 + 1.5, 0.08, 1.8, 0.08, COL.wood);
+  addCollider(x, z, 9, true);
+  shadowSpots.push({ x: x + 4, z: z - 2, rx: 10, rz: 7, a: 0.18 });
+}
+
+/* ---------------- 树 / 地 / 山 / 物件 ---------------- */
+function tree(x, z, type) {
+  const y = terrainH(x, z);
+  const leaf = (cx, cy, cz, r, col) => world.sphere(cx, cy, cz, r, col, 7, 4);
+  if (type === 'poplar') {
+    world.cylinder(x, y, z, 0.16, 3.4, COL.trunk, 6);
+    world.cone(x, y + 3.1, z, 1.25, 2.8, COL.leaf2, 7);
+    world.cone(x, y + 5.2, z, 0.8, 2.1, COL.leaf1, 7);
+  } else if (type === 'jujube') {
+    // 疙瘩老干
+    world.box(x, y + 0.55, z, 0.3, 1.1, 0.32, COL.trunk, 0.25);
+    world.box(x + 0.14, y + 1.25, z - 0.08, 0.22, 0.9, 0.24, COL.trunk, -0.35);
+    world.box(x - 0.05, y + 1.75, z + 0.1, 0.17, 0.75, 0.19, COL.trunk, 0.6);
+    // 枝
+    world.box(x + 0.55, y + 2.05, z, 1.0, 0.09, 0.09, COL.trunk, 0.45);
+    world.box(x - 0.55, y + 1.95, z + 0.2, 0.9, 0.09, 0.09, COL.trunk, -0.55);
+    world.box(x + 0.1, y + 2.3, z - 0.55, 0.09, 0.09, 0.9, COL.trunk, 0.2);
+    // 稀疏叶簇
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * TAU, rr = 0.55 + (i % 3) * 0.18;
+      leaf(x + Math.cos(a) * rr, y + 2.35 + (i % 4) * 0.16, z + Math.sin(a) * rr, 0.34 + (i % 2) * 0.12, i % 2 ? COL.leaf3 : COL.leaf1);
+    }
+    // 红枣
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * TAU, rr = 0.45 + (i % 4) * 0.15;
+      world.box(x + Math.cos(a) * rr, y + 2.2 + (i % 5) * 0.13, z + Math.sin(a) * rr, 0.09, 0.09, 0.09, [0.55, 0.12, 0.08]);
+    }
+  } else if (type === 'willow') {
+    world.cylinder(x, y, z, 0.24, 2.3, COL.trunk, 6);
+    leaf(x, y + 2.7, z, 1.35, COL.leaf1);
+    leaf(x + 1.0, y + 2.4, z + 0.3, 0.85, COL.leaf2);
+    leaf(x - 0.9, y + 2.3, z - 0.4, 0.8, COL.leaf2);
+    leaf(x + 0.2, y + 1.85, z + 0.9, 0.6, COL.leaf1);
+    leaf(x - 0.3, y + 1.8, z - 0.8, 0.55, COL.leaf1);
+  } else {
+    world.cylinder(x, y, z, 0.22, 2.3, COL.trunk, 6);
+    leaf(x, y + 3.0, z, 1.05, COL.leaf2);
+    leaf(x + 0.75, y + 2.75, z + 0.35, 0.72, COL.leaf1);
+    leaf(x - 0.7, y + 2.85, z - 0.25, 0.7, COL.leaf3);
+    leaf(x + 0.15, y + 3.65, z - 0.3, 0.62, COL.leaf1);
+    leaf(x - 0.2, y + 3.5, z + 0.5, 0.55, COL.leaf3);
+  }
+  addCollider(x, z, 0.6);
+}
+
+function field(cx, cz, w, d, col, tall) {
+  const x0 = cx - w / 2, x1 = cx + w / 2, z0 = cz - d / 2, z1 = cz + d / 2;
+  for (let x = x0; x < x1 - 0.01; x += 4) {
+    for (let z = z0; z < z1 - 0.01; z += 4) {
+      const xa = x, xb = Math.min(x + 4, x1), za = z, zb = Math.min(z + 4, z1);
+      const p00 = [xa, terrainH(xa, za) + 0.05, za];
+      const p01 = [xa, terrainH(xa, zb) + 0.05, zb];
+      const p11 = [xb, terrainH(xb, zb) + 0.05, zb];
+      const p10 = [xb, terrainH(xb, za) + 0.05, za];
+      world.quadN(p00, p01, p11, p10, [0, 1, 0], COL.dirt);
+    }
+  }
+  for (let z = z0 + 1; z < z1; z += 1.7) {
+    for (let x = x0 + 1; x < x1; x += 2.4) {
+      const y = terrainH(x, z);
+      world.box(x, y + (tall ? 0.55 : 0.2), z, 1.5, tall ? 1.1 : 0.4, 0.55, col);
+    }
+  }
+}
+
+function terraceField(cx, cz, w, d, dir, steps, stepH, stepD, col, tall) {
+  const along = dir === 'x+' || dir === 'x-';
+  const sgn = (dir === 'x+' || dir === 'z+') ? 1 : -1;
+  for (let i = 0; i < steps; i++) {
+    const off = (i - (steps - 1) / 2) * stepD * sgn;
+    const px = cx + (along ? off : 0);
+    const pz = cz + (!along ? off : 0);
+    // 这一级田面取上坡沿的地面高度，切进坡里
+    const ux = px - (along ? sgn * stepD / 2 : 0);
+    const uz = pz - (!along ? sgn * stepD / 2 : 0);
+    const y = terrainH(ux, uz) + 0.08;
+    world.box(px, y - 2.2, pz, along ? stepD : w, 5.0, along ? w : stepD, COL.dirt);
+    // 下坡沿的土坎，一直砌到坡面
+    const fx = px + (along ? sgn * stepD / 2 : 0);
+    const fz = pz + (!along ? sgn * stepD / 2 : 0);
+    const yDown = terrainH(fx, fz);
+    const wh = Math.max(0.7, y - yDown + 0.5);
+    world.box(fx, y - wh / 2, fz, along ? 0.5 : w, wh, along ? w : 0.5, COL.earthDark);
+    world.box(fx, y + 0.12, fz, along ? 0.62 : w, 0.22, along ? w : 0.62, COL.stoneLight);
+    // 庄稼
+    const rows = Math.max(2, Math.floor(w / 2.2));
+    for (let r = 0; r < rows; r++) {
+      const ro = (r - (rows - 1) / 2) * 2.2;
+      const cxp = px + (along ? 0 : ro);
+      const czp = pz + (along ? ro : 0);
+      world.box(cxp, y + (tall ? 0.6 : 0.25), czp,
+        along ? stepD - 1.4 : 1.0, tall ? 1.1 : 0.45, along ? 1.0 : stepD - 1.4, col);
+    }
+  }
+}
+
+function buildMountains() {
+  // 山已经在地形里，见 terrainH 的 ring/PEAKS
+}
+
+function buildProps() {
+  // 电线杆
+  for (let z = -120; z <= 150; z += 34) {
+    const x = roadX(z) + 4.6;
+    const y = terrainH(x, z);
+    world.cylinder(x, y, z, 0.13, 7.4, COL.wood, 6);
+    world.box(x, y + 6.9, z, 1.9, 0.12, 0.12, COL.wood);
+  }
+  // 井
+  const wx = -36, wz = 14, wy = terrainH(wx, wz);
+  world.cylinder(wx, wy, wz, 1.1, 0.9, COL.stone, 10);
+  world.discXZ(wx, wy + 0.91, wz, 0.85, [0.12, 0.16, 0.17], 12);
+  world.box(wx - 1.15, wy + 1.5, wz, 0.12, 2.6, 0.12, COL.wood);
+  world.box(wx + 1.15, wy + 1.5, wz, 0.12, 2.6, 0.12, COL.wood);
+  world.box(wx, wy + 2.75, wz, 2.5, 0.12, 0.12, COL.wood);
+  addCollider(wx, wz, 1.3);
+
+  // 麦秸垛
+  for (const p of [[-30, 34], [52, -18], [-52, -6]]) {
+    const y = terrainH(p[0], p[1]);
+    world.cylinder(p[0], y, p[1], 1.45, 1.15, COL.wheat, 9);
+    world.cone(p[0], y + 1.15, p[1], 1.55, 1.05, COL.wheat, 9);
+    addCollider(p[0], p[1], 1.6);
+  }
+
+  // 大队部喇叭
+  const lx = -30, lz = 26, ly = terrainH(lx, lz);
+  world.cylinder(lx, ly, lz, 0.11, 7.2, COL.wood, 6);
+  for (let i = 0; i < 4; i++) {
+    const a = i / 4 * TAU;
+    world.cone(lx + Math.cos(a) * 0.55, ly + 6.5, lz + Math.sin(a) * 0.55, 0.4, 0.85, COL.woodDark, 7);
+  }
+
+  // 金光亮家的蜂箱
+  for (let i = 0; i < 6; i++) {
+    const bx = 74 - 2 + (i % 3) * 1.4, bz = 30 + Math.floor(i / 3) * 1.1;
+    const by = terrainH(bx, bz);
+    world.box(bx, by + 0.35, bz, 0.9, 0.7, 0.7, COL.wood);
+  }
+
+  // 公路边的手扶拖拉机
+  const tx = roadX(78) + 3.2, tz = 78, ty = terrainH(tx, tz);
+  world.box(tx, ty + 0.55, tz, 2.6, 0.7, 1.3, COL.red);
+  world.box(tx + 0.5, ty + 1.15, tz, 0.9, 0.6, 1.1, COL.red);
+  world.box(tx - 0.9, ty + 0.45, tz - 0.72, 1.5, 0.9, 0.24, COL.dark);
+  world.box(tx - 0.9, ty + 0.45, tz + 0.72, 1.5, 0.9, 0.24, COL.dark);
+
+  // 学校操场：篮球架
+  const sx = 19, sz = 52, sy = terrainH(sx, sz);
+  world.cylinder(sx, sy, sz, 0.1, 3.0, COL.wood, 6);
+  world.box(sx, sy + 3.1, sz, 0.1, 1.1, 1.6, COL.wood);
+  world.box(sx, sy + 2.72, sz, 0.9, 0.08, 0.08, COL.rust || COL.red);
+
+  // 龙王庙前的旗杆
+  const fx = 17, fz2 = 44, fy = terrainH(fx, fz2);
+  world.cylinder(fx, fy, fz2, 0.07, 7.0, COL.wood, 5);
+  world.box(fx + 0.55, fy + 6.5, fz2, 1.1, 0.7, 0.04, COL.red);
+}
+
+/* ---------------- 村庄 ---------------- */
+/* ---------------- 窑洞院落 ---------------- */
+function addLandmark(name, x, z, h) { landmarks.push({ name: name, x: x, z: z, h: h || 4 }); }
+
+function wallColliders(x1, z1, x2, z2, tall) {
+  const len = Math.hypot(x2 - x1, z2 - z1);
+  const n = Math.max(1, Math.ceil(len / 1.3));
+  for (let i = 0; i <= n; i++) addCollider(lerp(x1, x2, i / n), lerp(z1, z2, i / n), 0.55, tall);
+}
+
+function caveHome(cfg) {
+  const x = cfg.x, z = cfg.z, w = cfg.w, D = cfg.face || 1;
+  const mat = cfg.mat === 'brick' ? COL.brick : cfg.mat === 'stone' ? COL.stone : COL.earth;
+  const trim = COL.stoneLight;
+  const y = terrainH(x, z);
+  const H = cfg.h || 3.2;
+  const n = cfg.arches || 3;
+  const sp = w / n;
+
+  // 石砌台基
+  world.box(x - D * 0.6, y - 0.7, z, 3.4, 1.4, w + 2.0, COL.stoneDark);
+  // 窑脸
+  world.box(x, y + H / 2, z, 0.8, H, w + 0.4, mat);
+  // 檐口与女儿墙
+  world.box(x + D * 0.22, y + H - 0.1, z, 1.2, 0.22, w + 0.9, trim);
+  world.box(x - D * 0.45, y + H + 0.32, z, 0.5, 0.64, w + 0.6, mat);
+  // 土顶
+  world.box(x - D * 1.55, y + H + 0.06, z, 2.8, 0.5, w + 1.4, COL.earthDark);
+
+  for (let i = 0; i < n; i++) {
+    const zz = z - w / 2 + sp * (i + 0.5);
+    // 石拱圈
+    world.disc(x + D * 0.43, y + 1.95, zz, 0.82, trim, 'x', 0, Math.PI, 14, D);
+    // 门洞
+    world.box(x + D * 0.46, y + 0.95, zz, 0.07, 1.9, 1.15, COL.dark);
+    world.disc(x + D * 0.49, y + 1.9, zz, 0.58, COL.dark, 'x', 0, Math.PI, 12, D);
+    // 木门
+    world.box(x + D * 0.53, y + 0.88, zz, 0.05, 1.7, 0.95, COL.wood);
+    world.box(x + D * 0.56, y + 0.88, zz, 0.02, 0.08, 0.95, COL.woodDark);
+    // 纸窗与窗棂
+    world.box(x + D * 0.53, y + 1.98, zz, 0.04, 0.55, 0.88, COL.paper);
+    world.box(x + D * 0.56, y + 1.98, zz, 0.02, 0.55, 0.05, COL.woodDark);
+    world.box(x + D * 0.56, y + 1.98, zz, 0.02, 0.05, 0.88, COL.woodDark);
+  }
+
+  // 二层窑
+  if (cfg.levels === 2) {
+    const y2 = y + H + 0.55;
+    const w2 = w * 0.62;
+    world.box(x - D * 1.6, y2 + 0.9, z, 0.7, 1.8, w2 + 0.4, mat);
+    world.box(x - D * 0.9, y2 + 1.85, z, 1.6, 0.2, w2 + 0.8, trim);
+    world.box(x - D * 2.7, y2 + 1.95, z, 2.2, 0.4, w2 + 1.1, COL.earthDark);
+    for (let i = 0; i < 2; i++) {
+      const zz = z - w2 / 2 + w2 * (i + 0.5) / 2;
+      world.disc(x - D * 1.24, y2 + 1.5, zz, 0.5, trim, 'x', 0, Math.PI, 10, D);
+      world.box(x - D * 1.27, y2 + 0.85, zz, 0.06, 1.3, 0.72, COL.dark);
+      world.disc(x - D * 1.3, y2 + 1.45, zz, 0.36, COL.dark, 'x', 0, Math.PI, 10, D);
+      world.box(x - D * 1.33, y2 + 1.5, zz, 0.03, 0.34, 0.5, COL.paper);
+    }
+  }
+
+  // 院子
+  if (cfg.yard !== false) {
+    const yd = cfg.yardDepth || 4.4;
+    const yw = w + 1.6;
+    const fx = x + D * (0.4 + yd);
+    const cy = x + D * (0.4 + yd / 2);
+    const yg = terrainH(cy, z);
+    const yf = terrainH(fx, z);
+    // 随地的薄铺装
+    world.box(cy, yg + 0.04, z, yd, 0.08, yw, COL.stoneDark);
+    // 两侧矮墙
+    world.box(cy, yg + 0.55, z - yw / 2, yd, 1.1, 0.3, COL.stone);
+    world.box(cy, yg + 0.55, z + yw / 2, yd, 1.1, 0.3, COL.stone);
+    wallColliders(cy - yd / 2, z - yw / 2, cy + yd / 2, z - yw / 2, false);
+    wallColliders(cy - yd / 2, z + yw / 2, cy + yd / 2, z + yw / 2, false);
+    // 前墙留门
+    const gap = 3.0, seg = (yw - gap) / 2;
+    world.box(fx, yf + 0.55, z - gap / 2 - seg / 2, 0.35, 1.1, seg, COL.stone);
+    world.box(fx, yf + 0.55, z + gap / 2 + seg / 2, 0.35, 1.1, seg, COL.stone);
+    wallColliders(fx, z - yw / 2, fx, z - gap / 2, false);
+    wallColliders(fx, z + gap / 2, fx, z + yw / 2, false);
+    if (cfg.gate) {
+      world.box(fx, yf + 1.55, z - 1.55, 0.5, 3.1, 0.5, COL.brick);
+      world.box(fx, yf + 1.55, z + 1.55, 0.5, 3.1, 0.5, COL.brick);
+      world.box(fx, yf + 3.14, z, 0.7, 0.26, 4.0, COL.woodDark);
+      world.roof(fx, yf + 3.28, z, 2.8, 0.9, 4.3, COL.tile);
+      world.box(fx, yf + 1.27, z, 0.14, 2.5, 2.5, COL.wood);
+      addCollider(fx, z - 1.55, 0.7, true);
+      addCollider(fx, z + 1.55, 0.7, true);
+    } else {
+      world.box(fx, yf + 1.05, z - 1.35, 0.45, 2.1, 0.45, COL.stone);
+      world.box(fx, yf + 1.05, z + 1.35, 0.45, 2.1, 0.45, COL.stone);
+      world.box(fx, yf + 2.15, z, 0.55, 0.2, 3.15, COL.woodDark);
+      addCollider(fx, z - 1.35, 0.55, false);
+      addCollider(fx, z + 1.35, 0.55, false);
+    }
+    // 水缸
+    if (cfg.jar) {
+      world.cylinder(x + D * 1.6, y + 0.55, z - w / 2 - 1.2, 0.5, 0.9, COL.stoneLight, 9);
+    }
+  }
+
+  // 窑脸碰撞
+  wallColliders(x, z - w / 2, x, z + w / 2, true);
+  shadowSpots.push({ x: x + D * 3, z: z - 1.2, rx: 4.2, rz: w * 0.6, a: 0.14 });
+  addLandmark(cfg.name, x + D * 2.6, z, H + 2.4);
+}
+
+function cow(x, z, rot, col) {
+  const y = terrainH(x, z);
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  const P = (dx, dz) => [x + dx * cs + dz * sn, z - dx * sn + dz * cs];
+  world.box(x, y + 1.0, z, 0.8, 0.75, 1.7, col, rot);
+  const h = P(0, 0.95);
+  world.box(h[0], y + 1.18, h[1], 0.55, 0.5, 0.55, col, rot);
+  const n = P(0, 1.25);
+  world.box(n[0], y + 1.02, n[1], 0.42, 0.32, 0.3, [0.85, 0.8, 0.72], rot);
+  for (const s2 of [-1, 1]) {
+    const hh = P(s2 * 0.2, 0.98);
+    world.cone(hh[0], y + 1.42, hh[1], 0.07, 0.26, [0.9, 0.85, 0.7], 5);
+  }
+  for (const dz of [-0.62, 0.62]) for (const dx of [-0.3, 0.3]) {
+    const q = P(dx, dz);
+    world.box(q[0], y + 0.35, q[1], 0.16, 0.7, 0.16, col, rot);
+  }
+  const t = P(0, -0.92);
+  world.box(t[0], y + 1.15, t[1], 0.06, 0.7, 0.06, col, rot);
+  addCollider(x, z, 1.0);
+}
+
+function donkey(x, z, rot, col) {
+  const y = terrainH(x, z);
+  world.box(x, y + 0.85, z, 0.55, 0.55, 1.2, col, rot);
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  const P = (dx, dz) => [x + dx * cs + dz * sn, z - dx * sn + dz * cs];
+  const h = P(0, 0.72);
+  world.box(h[0], y + 1.15, h[1], 0.34, 0.34, 0.4, col, rot);
+  for (const s2 of [-1, 1]) {
+    const e = P(s2 * 0.12, 0.74);
+    world.box(e[0], y + 1.45, e[1], 0.07, 0.32, 0.07, col, rot);
+  }
+  for (const dz of [-0.42, 0.42]) for (const dx of [-0.2, 0.2]) {
+    const q = P(dx, dz);
+    world.box(q[0], y + 0.32, q[1], 0.12, 0.64, 0.12, col, rot);
+  }
+  addCollider(x, z, 0.8);
+}
+
+/* ---------------- 村子的公共建筑 ---------------- */
+function buildPublic() {
+  // 大队部：石窑四孔，院子，旗杆与喇叭
+  caveHome({ x: -36, z: 26, w: 10, face: 1, arches: 4, mat: 'stone', yard: true, gate: true, name: '大队部' });
+  const by = terrainH(-33, 21);
+  world.cylinder(-33, by, 21, 0.07, 8.2, COL.wood, 5);
+  world.box(-32.4, by + 7.7, 21, 1.4, 0.8, 0.05, COL.red);
+  for (let i = 0; i < 3; i++) {
+    world.cone(-35.4, by + 3.1, 22 + i * 1.3, 0.32, 0.7, COL.woodDark, 6);
+  }
+  // 大队部门口的黑板
+  world.box(-30.8, by + 1.2, 23.6, 0.12, 1.4, 2.4, COL.woodDark);
+  world.box(-30.7, by + 1.2, 23.6, 0.02, 1.1, 2.0, [0.16, 0.2, 0.18]);
+
+  // 饲养室
+  const sx = -44, sz = 72, sy = terrainH(sx, sz);
+  world.box(sx, sy + 1.5, sz - 2.2, 8, 3, 0.4, COL.stone);
+  world.box(sx - 4, sy + 1.5, sz, 0.4, 3, 4.4, COL.stone);
+  world.box(sx + 4, sy + 1.5, sz, 0.4, 3, 4.4, COL.stone);
+  world.roof(sx, sy + 3, sz, 9, 1.2, 5.4, COL.tile);
+  world.box(sx - 2, sy + 0.45, sz + 1.2, 0.8, 0.5, 2.6, COL.stoneLight);
+  addLandmark('饲养室', sx, sz, 3.2);
+  cow(sx - 2.2, sz + 1.0, 0.05, [0.42, 0.28, 0.18]);
+  cow(sx + 1.0, sz + 1.15, -0.08, [0.56, 0.41, 0.27]);
+  donkey(sx - 3.2, sz - 0.6, 1.35, [0.40, 0.40, 0.38]);
+  world.box(sx - 0.5, sy + 0.48, sz + 2.0, 6.4, 0.4, 0.55, COL.wood);
+  world.box(sx - 0.5, sy + 0.3, sz + 2.0, 6.2, 0.2, 0.4, [0.28, 0.32, 0.24]);
+  world.cylinder(sx - 3.6, sy, sz + 1.6, 0.9, 1.5, COL.wheat, 7);
+  world.cone(sx - 3.6, sy + 1.5, sz + 1.6, 1.0, 0.8, COL.wheat, 7);
+
+  // 打谷场
+  const tx = -30, tz = 52, ty = terrainH(tx, tz);
+  world.discXZ(tx, ty + 0.06, tz, 9, COL.stoneDark, 26);
+  for (const p of [[-35, 56], [-24, 54], [-30, 47]]) {
+    world.cylinder(p[0], ty, p[1], 1.3, 1.0, COL.wheat, 8);
+    world.cone(p[0], ty + 1.0, p[1], 1.4, 0.9, COL.wheat, 8);
+  }
+  world.cylinder(tx + 3, ty + 0.4, tz - 3, 0.6, 0.5, COL.stoneLight, 10);
+  addLandmark('打谷场', tx, tz, 2.5);
+
+  // 砖窑（少安后来置办的）
+  const kx = 2, kz = 86, ky = terrainH(kx, kz);
+  world.cylinder(kx, ky, kz, 3.1, 2.6, COL.brickDark, 12);
+  world.cone(kx, ky + 2.6, kz, 3.2, 1.4, COL.brick, 12);
+  world.cylinder(kx + 2.6, ky, kz + 1.6, 0.5, 5.2, COL.brickDark, 8);
+  for (let i = 0; i < 3; i++) {
+    world.box(kx - 5 - i * 0.4, ky + 0.3 + i * 0.35, kz - 2 + i * 0.5, 2.2, 0.55, 1.2, COL.brick);
+  }
+  addLandmark('砖窑', kx, kz, 4.2);
+
+  // 孙家新窑
+  caveHome({ x: 14, z: 100, w: 9, face: -1, arches: 3, mat: 'brick', levels: 1, yard: true, gate: true, name: '孙家新窑', jar: true });
+  dirtPath([[2, 88], [8, 94], [12, 99]], 1.1);
+
+  // 金家老坟
+  const gx = 78, gz = -58, gy = terrainH(gx, gz);
+  for (let i = 0; i < 3; i++) {
+    world.box(gx + i * 1.6, gy + 0.7, gz + (i % 2) * 0.8, 0.5, 1.4, 0.25, COL.stoneLight, i * 0.4);
+    world.cone(gx + i * 1.6, gy + 1.4, gz + (i % 2) * 0.8, 0.55, 0.5, COL.earth, 7);
+  }
+  addLandmark('金家老坟', gx, gz, 2.2);
+}
+
+function buildVillage() {
+  // 田家圪崂（西岸，窑脸朝东）
+  caveHome({ x: -44, z: 8, w: 7, face: 1, arches: 2, mat: 'earth', yard: true, gate: false, name: '孙玉厚家', jar: true });
+  caveHome({ x: -40, z: -16, w: 9, face: 1, arches: 3, mat: 'brick', levels: 2, yard: true, gate: true, name: '田福堂家' });
+  caveHome({ x: -54, z: -22, w: 5, face: 1, arches: 1, mat: 'earth', h: 2.7, yard: true, gate: false, name: '孙玉亭家' });
+  // 偏厦、玉米秆、晾衣绳：和孙玉厚家隔开，也离田福堂家不远
+  const ly = terrainH(-55.5, -18.5);
+  world.box(-55.5, ly + 1.15, -18.5, 0.12, 2.3, 0.12, COL.wood);
+  world.box(-55.5, ly + 1.15, -15.5, 0.12, 2.3, 0.12, COL.wood);
+  world.box(-56.8, ly + 2.3, -17, 3.2, 0.14, 4.2, COL.wheat);
+  world.cylinder(-56.2, terrainH(-56.2, -28), -28, 0.85, 1.2, COL.wheat, 7);
+  world.cone(-56.2, terrainH(-56.2, -28) + 1.2, -28, 0.95, 0.7, COL.wheat, 7);
+  world.cylinder(-50, terrainH(-50, -24.5), -24.5, 0.05, 2.2, COL.wood, 5);
+  world.cylinder(-50, terrainH(-50, -19.5), -19.5, 0.05, 2.2, COL.wood, 5);
+  world.box(-50, terrainH(-50, -22) + 2.1, -22, 0.02, 0.02, 5.8, COL.woodDark);
+  world.box(-50, terrainH(-50, -23.2) + 1.65, -23.2, 0.03, 0.7, 0.5, [0.66, 0.31, 0.26]);
+  world.box(-50, terrainH(-50, -20.8) + 1.6, -20.8, 0.03, 0.6, 0.45, [0.34, 0.42, 0.52]);
+  caveHome({ x: -52, z: 58, w: 7, face: 1, arches: 2, mat: 'stone', yard: true, gate: false, name: '田海民家' });
+  caveHome({ x: -60, z: -32, w: 6.5, face: 1, arches: 2, mat: 'earth', yard: true, gate: false, name: '田福高家' });
+
+  // 金家湾（东岸，窑脸朝西）
+  caveHome({ x: 46, z: -8, w: 8, face: -1, arches: 3, mat: 'brick', yard: true, gate: true, name: '金波家', jar: true });
+  caveHome({ x: 64, z: -32, w: 9, face: -1, arches: 3, mat: 'brick', levels: 2, yard: true, gate: true, name: '金俊山家' });
+  caveHome({ x: 58, z: 12, w: 8, face: -1, arches: 3, mat: 'brick', yard: true, gate: true, name: '金俊武家' });
+  caveHome({ x: 72, z: -6, w: 7, face: -1, arches: 2, mat: 'stone', yard: true, gate: false, name: '金俊文家' });
+  caveHome({ x: 62, z: 24, w: 6, face: -1, arches: 2, mat: 'earth', yard: true, gate: false, name: '金俊斌家' });
+  caveHome({ x: 78, z: 26, w: 9, face: -1, arches: 3, mat: 'earth', yard: true, gate: true, name: '金光亮家' });
+  caveHome({ x: 68, z: 46, w: 7, face: -1, arches: 2, mat: 'brick', yard: true, gate: false, name: '金光明家' });
+  caveHome({ x: 84, z: 48, w: 6, face: -1, arches: 2, mat: 'earth', yard: true, gate: false, name: '金光辉家' });
+
+  // 学校：龙王庙，大殿做了教室；庙在哭咽河北岸的三角洲上
+  temple(28, 20);
+  courtyard(28, 20, 16, 11, 1.0);
+  addLandmark('龙王庙 · 旧小学', 28, 20, 7.2);
+
+  // 井、桥、坝、枣林
+  addLandmark('井台', -36, 14, 3);
+  addLandmark('枣树林', 18, 22, 4);
+
+  // 庙坪山：山顶眺望点
+  const mx = 50, mz = 92, my = terrainH(mx, mz);
+  world.discXZ(mx, my + 0.1, mz, 6.0, COL.stone, 20);
+  world.box(mx - 4.8, my + 0.45, mz + 2.5, 0.4, 0.7, 5.0, COL.stone);
+  world.box(mx + 4.8, my + 0.45, mz + 2.5, 0.4, 0.7, 5.0, COL.stone);
+  world.box(mx + 3.8, my + 0.55, mz - 4.4, 2.6, 0.22, 0.55, COL.wood);
+  world.box(mx + 3.8, my + 0.3, mz - 4.4, 0.16, 0.5, 0.5, COL.wood);
+  world.box(mx + 4.6, my + 0.35, mz + 1.2, 1.2, 0.7, 1.2, COL.stoneDark);
+  world.box(mx + 4.6, my + 0.95, mz + 1.2, 0.8, 0.5, 0.8, COL.stoneLight);
+  world.cylinder(mx + 3.8, my, mz + 2.0, 0.1, 2.6, COL.wood, 5);
+  addLandmark('庙坪山', mx, mz, 5.5);
+  pois.push({ x: mx, z: mz, r: 8, name: '庙坪山', line: '站在山顶，能看见雾里的原西县城。' });
+
+  // 枣林 → 桥北
+  dirtPath([[20, 14], [18, 24], [22, 32], [27, 34], [30, 30]], 1.1);
+  // 桥南 → 山顶
+  dirtPath([[30, 45], [34, 58], [40, 72], [46, 84], [50, 92]], 1.1);
+
+  // 新小学：少安出钱重建，在哭咽河畔
+  caveHome({ x: 50, z: 22, w: 12, face: -1, arches: 3, mat: 'brick', levels: 1, yard: false, gate: false, name: '双水村小学（新）' });
+  const nx0 = 42, nz0 = 22, ny0 = terrainH(nx0, nz0);
+  world.box(nx0, ny0 + 0.04, nz0, 12, 0.08, 12, COL.stoneDark);
+  world.box(36.3, ny0 + 1.2, nz0 - 3.0, 0.35, 2.4, 0.35, COL.brick);
+  world.box(36.3, ny0 + 1.2, nz0 + 3.0, 0.35, 2.4, 0.35, COL.brick);
+  world.box(36.3, ny0 + 2.45, nz0, 0.35, 0.25, 6.4, COL.woodDark);
+  world.box(36.45, ny0 + 2.05, nz0, 0.08, 0.6, 3.4, [0.9, 0.86, 0.74]);
+  world.cylinder(42, ny0, nz0 - 6.0, 0.06, 6.2, COL.wood, 5);
+  world.box(42.65, ny0 + 5.6, nz0 - 6.0, 1.1, 0.65, 0.04, COL.red);
+  world.cylinder(46, ny0, nz0 + 4.0, 0.1, 3.0, COL.wood, 6);
+  world.box(46, ny0 + 3.1, nz0 + 4.0, 0.1, 1.0, 1.5, COL.wood);
+  addLandmark('操场', 42, 22, 2.5);
+
+  // 原西县城在五十里外，见 buildCountyTown
+
+  buildPublic();
+  buildWorksite();
+  buildOutlying();
+  buildPoisForVillage();
+}
+
+function buildWorksite() {
+  const gx = -2, gz = 64, gy = terrainH(gx, gz);
+  // 正在夯的土坝
+  world.box(gx, gy + 1.15, gz, 6.5, 2.3, 24, COL.earth);
+  world.box(gx - 0.4, gy + 2.36, gz, 7.4, 0.18, 24.2, COL.dirt);
+  world.box(gx + 3.9, gy + 0.65, gz, 3.2, 1.3, 24, COL.earthDark);
+  for (let i = 0; i < 3; i++) {
+    world.box(gx - 3.6 + i * 0.42, gy + 0.2 + i * 0.36, gz, 0.5, 0.4, 24, COL.earthDark);
+  }
+  // 坝上红旗
+  for (let i = 0; i < 4; i++) {
+    const fz = gz - 9 + i * 6;
+    world.cylinder(gx, gy + 2.4, fz, 0.05, 3.6, COL.wood, 5);
+    world.box(gx + 0.62, gy + 5.55, fz, 1.2, 0.7, 0.04, COL.red);
+  }
+  // 北头标语牌
+  const bz = gz - 13.2;
+  world.cylinder(gx - 2.6, gy, bz, 0.08, 3.0, COL.wood, 5);
+  world.cylinder(gx + 2.6, gy, bz, 0.08, 3.0, COL.wood, 5);
+  world.box(gx, gy + 2.55, bz, 6.4, 1.35, 0.12, COL.red);
+  world.box(gx, gy + 2.55, bz - 0.08, 5.8, 1.0, 0.02, [0.9, 0.82, 0.66]);
+  for (let i = 0; i < 5; i++) world.box(gx - 2.0 + i * 1.0, gy + 2.55, bz - 0.1, 0.58, 0.58, 0.03, COL.red);
+  // 坝东材料场：一溜架子车
+  for (const p2 of [[gx + 5, gz - 6], [gx + 5, gz], [gx + 5, gz + 6]]) {
+    const yy = terrainH(p2[0], p2[1]);
+    world.box(p2[0], yy + 0.55, p2[1], 1.6, 0.35, 0.9, COL.wood);
+    world.box(p2[0], yy + 0.82, p2[1] - 0.5, 0.1, 0.7, 0.1, COL.wood);
+    world.box(p2[0] - 0.55, yy + 0.32, p2[1] - 0.45, 0.5, 0.5, 0.12, COL.dark, 0.5);
+    world.box(p2[0] + 0.55, yy + 0.32, p2[1] - 0.45, 0.5, 0.5, 0.12, COL.dark, -0.5);
+  }
+  // 土堆：靠外一排
+  for (const p2 of [[gx + 8, gz - 3], [gx + 8, gz + 4], [gx + 8, gz + 9]]) {
+    const yy = terrainH(p2[0], p2[1]);
+    world.cone(p2[0], yy, p2[1], 2.3, 1.5, COL.earth, 8);
+  }
+  // 三角架：坝顶
+  const ty = terrainH(gx + 1, gz + 4);
+  for (let i = 0; i < 3; i++) {
+    const a = i / 3 * TAU;
+    world.box(gx + 1 + Math.cos(a) * 1.3, ty + 1.6, gz + 4 + Math.sin(a) * 1.3, 0.12, 3.2, 0.12, COL.wood, a);
+  }
+  // 喇叭
+  world.cylinder(gx - 4, gy, gz - 8, 0.08, 5, COL.wood, 5);
+  world.cone(gx - 4, gy + 4.8, gz - 8, 0.35, 0.7, COL.woodDark, 6);
+  // 工棚
+  world.box(gx + 7, gy + 1.1, gz + 10, 4, 2.2, 4, COL.earthDark);
+  world.roof(gx + 7, gy + 2.2, gz + 10, 5, 0.9, 5, COL.tile);
+  wallColliders(gx - 3.3, gz - 12, gx - 3.3, gz + 12, true);
+  wallColliders(gx + 3.3, gz - 12, gx + 3.3, gz + 12, true);
+  addLandmark('基建会战工地', gx, gz, 6.2);
+  shadowSpots.push({ x: gx, z: gz, rx: 8, rz: 14, a: 0.15 });
+}
+
+function buildOutlying() {
+  // 罐子村：几孔破窑，一口井，一所小学
+  cave(-48, 140, 5);
+  cave(-54, 148, 4.5);
+  cave(-46, 154, 4.5);
+  cave(-52, 160, 5);
+  const wy = terrainH(-50, 150);
+  world.cylinder(-50, wy, 150, 1.0, 0.9, COL.stone, 10);
+  world.discXZ(-50, wy + 0.91, 150, 0.8, [0.12, 0.16, 0.17], 10);
+  house(-42, 148, 5, 4, 2.6, 'x+');
+  addLandmark('罐子村', -48, 148, 6);
+  addLandmark('罐子村小学', -42, 148, 4);
+  dirtPath([[roadX(148), 148], [-44, 148]], 1.0);
+
+  // 石圪节公社：革委会、供销社、卫生院、理发店、集市
+  house(-48, 182, 10, 7, 4.0, 'x+');
+  const cy = terrainH(-42, 182);
+  world.cylinder(-42, cy, 182, 0.07, 8, COL.wood, 5);
+  world.box(-41.4, cy + 7.5, 182, 1.3, 0.75, 0.05, COL.red);
+  world.box(-42.6, cy + 2.6, 181, 0.1, 1.0, 3.4, [0.9, 0.86, 0.74]);
+  house(-48, 190, 7, 5, 3.2, 'x+');
+  house(-56, 190, 7, 5, 3.2, 'x+');
+  world.box(-52.4, terrainH(-52.4, 190) + 2.2, 190, 0.1, 1.2, 1.2, [0.92, 0.9, 0.84]);
+  world.box(-52.4, terrainH(-52.4, 190) + 2.2, 190, 0.12, 0.3, 1.0, COL.red);
+  world.box(-52.4, terrainH(-52.4, 190) + 2.2, 190, 0.12, 0.9, 0.3, COL.red);
+  house(-42, 176, 4.5, 4, 2.8, 'x+');
+  // 集市棚子
+  for (const p2 of [[-36, 178], [-36, 182], [-36, 186]]) {
+    const sy = terrainH(p2[0], p2[1]);
+    world.cylinder(p2[0], sy, p2[1] - 1.2, 0.06, 2.2, COL.wood, 5);
+    world.cylinder(p2[0], sy, p2[1] + 1.2, 0.06, 2.2, COL.wood, 5);
+    world.box(p2[0], sy + 2.3, p2[1], 1.8, 0.08, 3.0, [0.72, 0.62, 0.46]);
+    world.box(p2[0], sy + 0.45, p2[1], 1.4, 0.5, 2.2, COL.wood);
+  }
+  addLandmark('石圪节公社', -44, 184, 6);
+  for (const mz2 of [216, 247, 278, 309]) {
+    const mx2 = roadX(mz2) - 3.6;
+    world.cylinder(mx2, terrainH(mx2, mz2), mz2, 0.18, 1.1, COL.stoneLight, 6);
+    world.box(mx2, terrainH(mx2, mz2) + 1.2, mz2, 0.5, 0.5, 0.1, [0.9, 0.86, 0.74]);
+  }
+  const thy = terrainH(-27, 264);
+  world.cylinder(-33, thy, 263, 0.07, 2.4, COL.wood, 5);
+  world.cylinder(-33, thy, 265, 0.07, 2.4, COL.wood, 5);
+  world.box(-33, thy + 2.4, 264, 2.6, 0.1, 3.4, COL.wheat);
+  world.box(-33, thy + 0.55, 264, 2.0, 0.12, 0.5, COL.wood);
+  addLandmark('革委会', -48, 182, 5);
+  addLandmark('供销社', -48, 190, 4);
+  addLandmark('卫生院', -56, 190, 4);
+  dirtPath([[roadX(184), 184], [-36, 184], [-44, 184]], 1.2);
+  buildCountyTown();
+}
+
+function buildCountyTown() {
+  const cz = 342, cx0 = roadX(cz);
+  TOWN_Y = terrainH(cx0, cz);
+  TOWN_X0 = cx0 - 20;
+  TOWN_X1 = cx0 + 20;
+  const z0 = 322, z1 = 368, zc = 345;
+  // 台地
+  world.box(cx0, TOWN_Y - 0.6, zc, 40, 1.2, 46, COL.stoneDark);
+  world.box(cx0, TOWN_Y - 3.0, z1, 40, 6, 0.8, COL.stone);
+  world.box(cx0, TOWN_Y - 3.0, z0, 40, 6, 0.8, COL.stone);
+  world.box(cx0 - 20.4, TOWN_Y - 3.0, zc, 0.8, 6, 46, COL.stone);
+  world.box(cx0 + 20.4, TOWN_Y - 3.0, zc, 0.8, 6, 46, COL.stone);
+  // 石板街、十字街
+  world.box(cx0, TOWN_Y + 0.05, zc, 9, 0.1, 44, COL.stoneDark);
+  world.box(cx0, TOWN_Y + 0.07, zc, 7, 0.1, 44, COL.stoneLight);
+  world.box(cx0 - 8, TOWN_Y + 0.07, cz, 18, 0.1, 7, COL.stoneLight);
+  // 北门
+  for (const s2 of [-1, 1]) {
+    world.box(cx0 + s2 * 5.0, TOWN_Y + 2.4, z0, 1.4, 4.8, 1.4, COL.brick);
+  }
+  world.box(cx0, TOWN_Y + 4.8, z0, 12, 1.3, 1.8, COL.brick);
+  world.roof(cx0, TOWN_Y + 5.6, z0, 13, 1.2, 3.4, COL.tile);
+  world.box(cx0, TOWN_Y + 3.9, z0 + 1, 4.6, 0.9, 0.12, [0.9, 0.86, 0.74]);
+  // 县委、百货、邮局、电影院、汽车站、食堂、招待所
+  house(cx0 - 9, 336, 14, 8, 4.6, 'x+');
+  house(cx0 - 9, 344, 10, 7, 3.8, 'x+');
+  house(cx0 - 10, 352, 6, 5, 3.2, 'x+');
+  house(cx0 - 9, 358, 12, 7, 5.2, 'x+');
+  house(cx0 + 9, 334, 8, 6, 3.4, 'x-');
+  house(cx0 + 10, 356, 8, 6, 3.4, 'x-');
+  house(cx0 + 10, 365, 8, 6, 3.6, 'x-');
+  world.cylinder(cx0 - 2, TOWN_Y, 336, 0.08, 9, COL.wood, 5);
+  world.box(cx0 - 1.3, TOWN_Y + 8.5, 336, 1.4, 0.8, 0.05, COL.red);
+  world.discXZ(cx0 + 9, TOWN_Y + 0.08, 344, 7, [0.62, 0.5, 0.36], 18);
+
+  // 县立中学：城北高台，大陡坡上去
+  const sy = TOWN_Y + 2.6;
+  world.box(cx0 - 12, TOWN_Y + 1.3, 316, 16, 2.6, 9, COL.earthDark);
+  for (const rz of [313, 316, 319]) {
+    world.box(cx0 - 16, sy + 1.5, rz, 7, 3, 2.6, COL.brick);
+    world.roof(cx0 - 16, sy + 3, rz, 8, 1.2, 3.6, COL.tile);
+    world.box(cx0 - 12.5 + 0.05, sy + 1.0, rz, 0.08, 2, 0.9, COL.dark);
+    world.box(cx0 - 12.5 + 0.06, sy + 1.65, rz - 0.85, 0.06, 0.7, 0.7, COL.paper);
+    world.box(cx0 - 12.5 + 0.06, sy + 1.65, rz + 0.85, 0.06, 0.7, 0.7, COL.paper);
+  }
+  world.box(cx0 - 8, sy - 0.06, 316, 7, 0.1, 7.5, COL.dirt);
+  world.cylinder(cx0 - 9, sy, 314, 0.06, 5.6, COL.wood, 5);
+  world.box(cx0 - 8.3, sy + 5.2, 314, 1.2, 0.6, 0.04, COL.red);
+  // 校门（朝南）与大陡坡
+  for (const s2 of [-1, 1]) {
+    world.box(cx0 - 7 + s2 * 2.6, sy + 1.2, 320.5, 0.9, 2.4, 0.9, COL.brick);
+  }
+  world.box(cx0 - 7, sy + 2.5, 320.5, 5.6, 0.7, 0.5, COL.brick);
+  world.box(cx0 - 7, sy + 2.0, 320.5, 3.2, 0.5, 0.1, [0.9, 0.86, 0.74]);
+  for (let i = 0; i < 6; i++) {
+    world.box(cx0 - 7, TOWN_Y + 0.25 + i * 0.42, 321.5 + i * 0.55, 4.2, 0.42, 0.55, COL.stone);
+  }
+  addLandmark('原西县城', cx0 - 2, cz, 12);
+  addLandmark('十字街', cx0 - 8, cz, 4);
+  addLandmark('县立中学', cx0 - 14, 316, 8);
+  addLandmark('大陡坡', cx0 - 7, 321, 4);
+  addLandmark('汽车站', cx0 + 9, 334, 4);
+  addLandmark('国营食堂', cx0 + 10, 356, 4);
+  buildBasketCourt(cx0);
+}
+
+function buildBasketCourt(cx0) {
+  const bx = cx0 + 8, bz = 312, by = terrainH(bx, bz);
+  COURT = { x: bx, z: bz, by: by };
+  const white = [0.92, 0.9, 0.82];
+  world.box(bx, by + 0.04, bz, 16, 0.14, 10, [0.58, 0.58, 0.55]);
+  world.box(bx, by + 0.13, bz - 4.8, 15.6, 0.02, 0.1, white);
+  world.box(bx, by + 0.13, bz + 4.8, 15.6, 0.02, 0.1, white);
+  world.box(bx - 7.8, by + 0.13, bz, 0.1, 0.02, 9.6, white);
+  world.box(bx + 7.8, by + 0.13, bz, 0.1, 0.02, 9.6, white);
+  world.box(bx, by + 0.13, bz, 15.6, 0.02, 0.1, white);
+  for (let i = 0; i < 20; i++) {
+    const a = i / 20 * TAU;
+    world.box(bx + Math.cos(a) * 1.8, by + 0.14, bz - 2.4 + Math.sin(a) * 1.8, 0.18, 0.02, 0.18, white);
+  }
+  world.cylinder(bx, by, bz - 4.9, 0.13, 3.9, COL.wood, 8);
+  world.box(bx, by + 3.75, bz - 4.95, 2.0, 1.25, 0.12, [0.9, 0.9, 0.86]);
+  world.box(bx, by + 3.3, bz - 5.0, 0.7, 0.45, 0.03, [0.2, 0.2, 0.2]);
+  for (let i = 0; i < 10; i++) {
+    const a = i / 10 * TAU;
+    world.box(bx + Math.cos(a) * 0.3, by + 3.05, bz - 4.4 + Math.sin(a) * 0.3, 0.12, 0.07, 0.12, [0.85, 0.35, 0.1]);
+  }
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * TAU;
+    world.box(bx + Math.cos(a) * 0.26, by + 2.8, bz - 4.4 + Math.sin(a) * 0.26, 0.03, 0.45, 0.03, [0.9, 0.9, 0.86]);
+  }
+  world.sphere(bx + 1.2, by + 0.16, bz + 1.2, 0.14, [0.85, 0.45, 0.13], 10, 6);
+  addLandmark('篮球场', bx, bz, 3.4);
+}
+
+function mixc(a, wa, b, wb, c, wc) {
+  const w = wa + wb + wc;
+  return [(a[0] * wa + b[0] * wb + c[0] * wc) / w, (a[1] * wa + b[1] * wb + c[1] * wc) / w, (a[2] * wa + b[2] * wb + c[2] * wc) / w];
+}
+
+function updateDayNight(dt) {
+  if (dayCycle) { dayTime += dt * 0.05; if (dayTime >= 24) dayTime -= 24; }
+  const az = (dayTime - 6) / 12 * Math.PI;
+  const el = Math.sin(az);
+  const wDay = clamp((el - 0.02) / 0.4, 0, 1);
+  const wNight = clamp((-el - 0.02) / 0.35, 0, 1);
+  const wDusk = Math.max(0, 1 - wDay - wNight);
+  const dayTop = [0.30, 0.47, 0.66], dayHor = [0.93, 0.78, 0.60], dayFog = [0.90, 0.76, 0.58], dayAmb = [0.60, 0.60, 0.63], daySun = [1.02, 0.88, 0.68];
+  const duskTop = [0.22, 0.22, 0.38], duskHor = [0.95, 0.50, 0.30], duskFog = [0.62, 0.46, 0.36], duskAmb = [0.36, 0.32, 0.36], duskSun = [1.0, 0.55, 0.30];
+  const nightTop = [0.05, 0.07, 0.14], nightHor = [0.11, 0.13, 0.22], nightFog = [0.08, 0.10, 0.16], nightAmb = [0.24, 0.26, 0.34], nightSun = [0.40, 0.46, 0.62];
+  SKY_TOP = mixc(nightTop, wNight, duskTop, wDusk, dayTop, wDay);
+  SKY_HOR = mixc(nightHor, wNight, duskHor, wDusk, dayHor, wDay);
+  FOG = mixc(nightFog, wNight, duskFog, wDusk, dayFog, wDay);
+  AMB = mixc(nightAmb, wNight, duskAmb, wDusk, dayAmb, wDay);
+  SUN_COL = mixc(nightSun, wNight, duskSun, wDusk, daySun, wDay);
+  SUN_DIR = v3.norm([Math.cos(az) * 0.8, Math.max(-0.7, el) * 0.9 + 0.04, 0.36]);
+  const hh = Math.floor(dayTime), mm = Math.floor((dayTime - hh) * 60);
+  const el2 = document.getElementById('clock');
+  const txt = (hh < 10 ? '0' + hh : hh) + ':' + (mm < 10 ? '0' + mm : mm);
+  if (el2 && el2.textContent !== txt) el2.textContent = txt;
+}
+
+function toggleDayCycle() {
+  dayCycle = !dayCycle;
+  if (!dayCycle) dayTime = 10.0;
+  hintText(dayCycle ? '昼夜循环：开' : '昼夜循环：关（停在白天）');
+}
+
+function mtof(semi) { return 293.66 * Math.pow(2, semi / 12); }
+
+function playNote(freq, t, vol, dur) {
+  if (!actx) return;
+  const o = actx.createOscillator();
+  o.type = 'triangle';
+  o.frequency.value = freq;
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  g.connect(mBus);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+}
+
+function scheduleMusic() {
+  if (!actx || !musicOn) return;
+  const stepDur = 0.46;
+  while (mNext < actx.currentTime + 0.35) {
+    const pat = M_PAT[mStep % M_PAT.length];
+    if (pat >= 0) {
+      const night = SUN_DIR[1] < -0.02;
+      const semi = M_SCALE[pat] + (night ? -12 : 0);
+      playNote(mtof(semi), mNext, night ? 0.09 : 0.12, night ? 1.8 : 1.5);
+      if (mStep % 8 === 0) playNote(mtof(semi - 12), mNext, 0.05, 2.2);
+    }
+    mNext += stepDur;
+    mStep++;
+  }
+}
+
+function initMusic() {
+  if (actx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  mMaster = actx.createGain();
+  mMaster.gain.value = 0.0;
+  mMaster.connect(actx.destination);
+  const delay = actx.createDelay();
+  delay.delayTime.value = 0.42;
+  const fb = actx.createGain();
+  fb.gain.value = 0.3;
+  const wet = actx.createGain();
+  wet.gain.value = 0.32;
+  delay.connect(fb);
+  fb.connect(delay);
+  delay.connect(wet);
+  wet.connect(mMaster);
+  mBus = actx.createGain();
+  mBus.gain.value = 0.5;
+  mBus.connect(mMaster);
+  mBus.connect(delay);
+  for (const f of [73.42, 110.0, 146.83]) {
+    const o = actx.createOscillator();
+    o.type = 'sine';
+    o.frequency.value = f;
+    const g = actx.createGain();
+    g.gain.value = 0.03;
+    o.connect(g);
+    g.connect(mMaster);
+    o.start();
+  }
+  mNext = actx.currentTime + 0.2;
+  mTimer = setInterval(scheduleMusic, 120);
+}
+
+function startMusic() {
+  initMusic();
+  if (!actx) return;
+  if (actx.state === 'suspended') actx.resume();
+  if (musicOn) mMaster.gain.setTargetAtTime(0.5, actx.currentTime, 0.8);
+}
+
+function toggleMusic() {
+  musicOn = !musicOn;
+  initMusic();
+  if (actx && actx.state === 'suspended') actx.resume();
+  if (actx) mMaster.gain.setTargetAtTime(musicOn ? 0.5 : 0.0, actx.currentTime, 0.25);
+  const b = document.getElementById('musicBtn');
+  if (b) b.textContent = musicOn ? '音 乐' : '静 音';
+  hintText(musicOn ? '音乐：开' : '音乐：关');
+}
+
+function updateCombatHud() {
+  const hb = document.getElementById('hpBar');
+  if (hb) hb.style.width = Math.max(0, playerHp) + '%';
+  const wn = document.getElementById('wpnName');
+  if (wn) wn.textContent = weapon === 1 ? '剑' : '枪';
+  const am = document.getElementById('ammo');
+  if (am) am.textContent = weapon === 1 ? '近战' : (reloadT > 0 ? '换弹…' : ammo + ' / ' + maxAmmo);
+  const cr = document.getElementById('cross');
+  if (cr) cr.classList.toggle('on', weapon === 2 && started && !bball.active);
+}
+
+function spawnMob() {
+  if (mobs.length >= 7) return;
+  for (let i = 0; i < 24; i++) {
+    const a = Math.random() * TAU, d = 20 + Math.random() * 22;
+    const x = player.x + Math.cos(a) * d, z = player.z + Math.sin(a) * d;
+    if (Math.abs(x) > 320 || Math.abs(z) > 460) continue;
+    if (groundH(x, z) < WATER_Y) continue;
+    if (colliders.some((c) => Math.hypot(x - c.x, z - c.z) < c.r + 1.5)) continue;
+    mobs.push({ x: x, z: z, y: groundH(x, z), hp: 60, rot: 0, cd: 0 });
+    return;
+  }
+}
+
+function damagePlayer(n) {
+  if (dead) return;
+  alertHelpers();
+  playerHp -= n;
+  hurtT = 0.22;
+  const h = document.getElementById('hurt');
+  if (h) h.classList.add('on');
+  if (playerHp <= 0) { playerHp = 0; dead = true; respawnT = 1.6; }
+}
+
+function attack() {
+  if (!started || fly || bball.active || dead) return;
+  if (atkCd > 0) return;
+  const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
+  player.rot = Math.atan2(fx, fz);
+  if (weapon === 1) {
+    atkCd = 0.55; swingT = 0.22;
+    for (const m of mobs) {
+      const dx = m.x - player.x, dz = m.z - player.z, d = Math.hypot(dx, dz) || 1;
+      if (d < 4.0 && (dx * fx + dz * fz) / d > 0.1) m.hp -= 55;
+    }
+  } else {
+    if (reloadT > 0) return;
+    if (ammo <= 0) { toast('没子弹了 · 按 R 换弹'); return; }
+    atkCd = 0.32; ammo--;
+    let best = null, bt = 999;
+    for (const m of mobs) {
+      const dx = m.x - player.x, dz = m.z - player.z;
+      const t = dx * fx + dz * fz;
+      if (t < 0 || t > 60) continue;
+      const perp = Math.abs(dx * fz - dz * fx);
+      if (perp < 0.9 && t < bt) { bt = t; best = m; }
+    }
+    if (!best) {
+      for (const m of mobs) {
+        const dx = m.x - player.x, dz = m.z - player.z, d = Math.hypot(dx, dz) || 1;
+        if (d < 32 && (dx * fx + dz * fz) / d > 0.55 && d < bt) { bt = d; best = m; }
+      }
+    }
+    if (best) best.hp -= 70;
+  }
+}
+
+function setWeapon(w) {
+  if (weapon === w) return;
+  weapon = w; reloadT = 0;
+  updateCombatHud();
+  hintText(w === 1 ? '换成剑 · J 挥砍' : '换成枪 · J 射击 · R 换弹');
+}
+
+function reload() {
+  if (weapon !== 2 || reloadT > 0 || ammo === maxAmmo) return;
+  reloadT = 1.2;
+  hintText('换弹…');
+}
+
+function respawn() {
+  player.x = 2; player.z = 26;
+  player.y = groundH(player.x, player.z);
+  playerHp = maxHp; dead = false; mobs = [];
+  cam.yaw = -Math.PI / 2;
+  hintText('你在村口醒了过来');
+}
+
+function updateCombat(dt) {
+  if (dead) {
+    respawnT -= dt;
+    if (respawnT <= 0) respawn();
+    return;
+  }
+  if (hurtT > 0) { hurtT -= dt; if (hurtT <= 0) { const h = document.getElementById('hurt'); if (h) h.classList.remove('on'); } }
+  if (atkCd > 0) atkCd -= dt;
+  if (swingT > 0) swingT -= dt;
+  if (reloadT > 0) { reloadT -= dt; if (reloadT <= 0) ammo = maxAmmo; }
+  if (weapon === 1 && swingT > 0) {
+    player.model.armR.rot[0] = -1.9;
+  }
+  const night = SUN_DIR[1] < -0.02;
+  if (!night) {
+    // 天亮以后不再刷怪，已有的野狗也散掉
+    if (mobs.length) mobs = [];
+    mobTimer = 2.5;
+  } else {
+    mobTimer -= dt;
+    if (mobTimer <= 0) {
+      if (mobs.length < 6) spawnMob();
+      mobTimer = 4.5;
+    }
+  }
+  for (const m of mobs) {
+    const dx = player.x - m.x, dz = player.z - m.z, d = Math.hypot(dx, dz) || 1;
+    if (d < 45) {
+      const sp = SUN_DIR[1] < 0 ? 2.8 : 2.0;
+      m.x += dx / d * sp * dt; m.z += dz / d * sp * dt;
+      m.rot = Math.atan2(dx, dz);
+      if (d < 1.9 && m.cd <= 0) { damagePlayer(9); m.cd = 1.3; }
+    }
+    if (m.cd > 0) m.cd -= dt;
+    m.y = groundH(m.x, m.z);
+  }
+  mobs = mobs.filter((m) => m.hp > 0 && Math.hypot(m.x - player.x, m.z - player.z) < 100);
+  if (mobs.some((m) => Math.hypot(m.x - player.x, m.z - player.z) < 9)) alertHelpers();
+  updateCombatHud();
+}
+
+function buildCloudGeo() {
+  const g = new Geo();
+  const col = [0.97, 0.97, 0.95];
+  const puffs = [[0, 0, 0, 7], [5, 0.6, 1, 5], [-5, 0.3, -1, 5], [2, -0.4, 3, 4.2], [-2, -0.3, -3, 4.2], [8, 0.2, 0, 3.6], [-8, 0.1, -1, 3.4]];
+  for (const p of puffs) g.sphere(p[0], p[1], p[2], p[3], col, 8, 5);
+  return g;
+}
+
+function initClouds() {
+  for (let i = 0; i < 16; i++) {
+    clouds.push({
+      x: -280 + Math.random() * 560,
+      z: -280 + Math.random() * 560,
+      y: 82 + Math.random() * 46,
+      s: 1.5 + Math.random() * 1.5,
+      v: 1.2 + Math.random() * 1.8
+    });
+  }
+}
+
+function updateClouds(dt) {
+  for (const c of clouds) {
+    c.x += c.v * dt;
+    if (c.x > 290) c.x = -290;
+  }
+}
+
+function buildPoisForVillage() {
+  pois.length = 0;
+  pois.push({ x: -44, z: 8, r: 6.5, name: '孙玉厚家', line: '窑里飘出玉米面糊糊的味道。' });
+  pois.push({ x: -36, z: 26, r: 7, name: '大队部', line: '喇叭里正放着秦腔，唱到苦处，弦子拉得更低了。' });
+  pois.push({ x: 28, z: 20, r: 8, name: '龙王庙 · 学校', line: '大殿改成了教室，黑板就挂在龙王爷的位上。' });
+  pois.push({ x: 18, z: 22, r: 6, name: '枣树林', line: '枣子还没红，酸得倒牙。' });
+  pois.push({ x: 46, z: -8, r: 6, name: '金波家', line: '院里停着一辆飞鸽自行车，擦得锃亮。' });
+  pois.push({ x: -22, z: 30, r: 6, name: '公路', line: '往南十里是石圪节，往北三十里是米家镇。' });
+  pois.push({ x: -36, z: 14, r: 4, name: '井台', line: '井水凉，照得见人影。' });
+  pois.push({ x: 64, z: -32, r: 7, name: '金俊山家', line: '那头奶牛正卧在槽边，慢条斯理地反刍。' });
+  pois.push({ x: -40, z: -16, r: 7, name: '田福堂家', line: '砖墙砖窑，是双水村最气派的一院。' });
+  pois.push({ x: -24, z: 40, r: 6, name: '打谷场', line: '场上还堆着去年的麦秸，风一吹，簌簌地响。' });
+  pois.push({ x: 2, z: 86, r: 6, name: '砖窑', line: '窑膛里还热着，砖垛上落了薄薄一层灰。' });
+}
+
+/* ---------------- 植被与田地 ---------------- */
+function buildLandscape() {
+  // 公路白杨
+  for (let z = -110; z <= 150; z += 13) {
+    const x = roadX(z) + 5.8;
+    if (colliders.every((c) => Math.hypot(x - c.x, z - c.z) > c.r + 2)) tree(x, z, 'poplar');
+  }
+  // 枣树林：庙坪三角洲上
+  for (let i = 0; i < 20; i++) {
+    let x, z;
+    if (i < 14) { x = 15 + rnd() * 9; z = 8 + rnd() * 8; }
+    else { x = 30 + rnd() * 6; z = 26 + rnd() * 4; }
+    if (x > 19 && x < 37 && z > 13 && z < 26) continue;
+    if (x > 35 && x < 49 && z > 15 && z < 29) continue;
+    if (colliders.every((c) => Math.hypot(x - c.x, z - c.z) > c.r + 1.4)) tree(x, z, 'jujube');
+  }
+  // 河柳
+  for (const z of [-46, -18, 88, 118, 144]) {
+    const x = riverX(z) - 9 - rnd() * 3;
+    tree(x, z, 'willow');
+  }
+  // 房前屋后的槐树
+  for (let i = 0; i < 16; i++) {
+    const x = -80 + rnd() * 160, z = -70 + rnd() * 150;
+    if (Math.abs(x - riverX(z)) < 14) continue;
+    if (Math.abs(x) > 40 && Math.abs(x - roadX(z)) > 5 && Math.hypot(x + 10, z - 76) > 16 && colliders.every((c) => Math.hypot(x - c.x, z - c.z) > c.r + 7)) tree(x, z, 'locust');
+  }
+  // 田地
+  field(86, -8, 20, 14, COL.wheat, false);
+  field(92, 12, 18, 12, COL.wheat, false);
+  field(84, 34, 16, 12, COL.corn, true);
+  field(70, 52, 14, 10, COL.corn, true);
+  field(-78, -18, 14, 9, COL.wheat, false);
+  field(-84, 6, 12, 9, COL.wheat, false);
+  field(20, 110, 22, 14, COL.corn, true);
+  field(34, 104, 18, 12, COL.wheat, false);
+
+
+  scatterGrass();
+  scatterRocks();
+  riverReeds();
+  // 土路
+  dirtPath([[roadX(8), 8], [-40, 8]], 1.1);
+  dirtPath([[roadX(-14), -14], [-33, -14]], 1.0);
+  dirtPath([[roadX(26), 26], [-30, 26]], 1.1);
+  dirtPath([[roadX(-4), -4], [40, -4]], 1.2);
+  dirtPath([[riverX(14), 14], [riverX(14) + 2, 10], [-2, 4], [-30, 4]], 1.0);
+  dirtPath([[riverX(37), 37], [20, 37]], 1.0);
+  dirtPath([[30, 46], [30, 30], [28, 26]], 1.0);
+}
+
+function grassTuft(x, z) {
+  const y = terrainH(x, z);
+  const c = [0.34 + rnd() * 0.06, 0.40 + rnd() * 0.07, 0.17 + rnd() * 0.05];
+  for (let i = 0; i < 3; i++) {
+    const a = rnd() * TAU, h = 0.3 + rnd() * 0.35;
+    world.box(x + Math.cos(a) * 0.12, y + h / 2, z + Math.sin(a) * 0.12, 0.045, h, 0.045, c, a);
+  }
+}
+
+function scatterGrass() {
+  for (let i = 0; i < 1100; i++) {
+    const x = -150 + rnd() * 300, z = -150 + rnd() * 300;
+    const h = terrainH(x, z);
+    if (h < WATER_Y + 0.05) continue;
+    if (Math.abs(x - riverX(z)) < 15) continue;
+    if (terrainNormal(x, z)[1] < 0.78) continue;
+    let bad = false;
+    for (let j = 0; j < colliders.length; j++) {
+      const c = colliders[j];
+      if (Math.hypot(x - c.x, z - c.z) < c.r + 0.6) { bad = true; break; }
+    }
+    if (bad) continue;
+    grassTuft(x, z);
+  }
+}
+
+function scatterRocks() {
+  for (let i = 0; i < 90; i++) {
+    const x = -165 + rnd() * 330, z = -165 + rnd() * 320;
+    const h = terrainH(x, z);
+    if (h < WATER_Y - 0.3) continue;
+    const s = 0.4 + rnd() * 1.3;
+    world.box(x, h + s * 0.25, z, s, s * 0.55, s * 0.8, [0.46 + rnd() * 0.06, 0.43, 0.37], rnd() * 3);
+  }
+}
+
+function riverReeds() {
+  for (let z = -100; z < 150; z += 3) {
+    if (rnd() > 0.62) continue;
+    const side = rnd() > 0.5 ? 1 : -1;
+    const x = riverX(z) + side * (15 + rnd() * 2.2);
+    const y = Math.max(terrainH(x, z), WATER_Y);
+    for (let i = 0; i < 4; i++) {
+      world.box(x + (rnd() - 0.5) * 1.2, y + 0.7, z + (rnd() - 0.5) * 1.2, 0.05, 1.4, 0.05, [0.34, 0.41, 0.20]);
+    }
+  }
+}
+
+function dirtPath(pts, w) {
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const n = Math.max(1, Math.ceil(len / 3));
+    for (let k = 0; k < n; k++) {
+      const t0 = k / n, t1 = (k + 1) / n;
+      const x0 = lerp(a[0], b[0], t0), z0 = lerp(a[1], b[1], t0);
+      const x1 = lerp(a[0], b[0], t1), z1 = lerp(a[1], b[1], t1);
+      const dx = x1 - x0, dz = z1 - z0, l = Math.hypot(dx, dz) || 1;
+      const nx = -dz / l * w, nz = dx / l * w;
+      world.quadN(
+        [x0 - nx, terrainH(x0 - nx, z0 - nz) + 0.06, z0 - nz],
+        [x1 - nx, terrainH(x1 - nx, z1 - nz) + 0.06, z1 - nz],
+        [x1 + nx, terrainH(x1 + nx, z1 + nz) + 0.06, z1 + nz],
+        [x0 + nx, terrainH(x0 + nx, z0 + nz) + 0.06, z0 + nz],
+        [0, 1, 0], COL.dirt);
+    }
+  }
+}
+
+/* ---------------- 人物 ---------------- */
+function buildBikeGeo() {
+  const g = new Geo();
+  const tire = [0.10, 0.10, 0.10], frame = COL.red, metal = [0.42, 0.42, 0.40];
+  // 前后轮（竖着的圆盘）
+  for (const zz of [-0.58, 0.58]) {
+    g.disc(0, 0.36, zz, 0.36, tire, 'x', 0, TAU, 14, 1);
+    g.disc(0, 0.36, zz, 0.10, metal, 'x', 0, TAU, 8, 1);
+  }
+  // 车架
+  g.box(0, 0.58, -0.18, 0.06, 0.55, 0.06, frame);
+  g.box(0, 0.55, 0.27, 0.06, 0.55, 0.06, frame);
+  g.box(0, 0.80, 0.05, 0.05, 0.05, 0.95, frame);
+  g.box(0, 0.62, 0.55, 0.06, 0.62, 0.06, metal);
+  g.box(0, 1.02, 0.55, 0.56, 0.05, 0.05, metal);
+  g.box(0, 0.95, -0.20, 0.26, 0.07, 0.30, [0.16, 0.14, 0.12]);
+  g.box(0, 0.92, 0.50, 0.30, 0.05, 0.05, metal);
+  // 脚踏与链轮
+  g.disc(0, 0.30, -0.02, 0.13, metal, 'x', 0, TAU, 8, 1);
+  g.box(-0.12, 0.30, -0.02, 0.24, 0.05, 0.05, metal);
+  // 后座
+  g.box(0, 0.86, -0.52, 0.24, 0.05, 0.26, [0.30, 0.28, 0.24]);
+  return g;
+}
+
+function makePerson(cfg) {
+  const p = { parts: [], x: 0, y: 0, z: 0, rot: 0, phase: 0 };
+  function add(geo, px, py, pz) {
+    const m = upload(geo);
+    const part = { m: m, pos: [px, py, pz], rot: [0, 0, 0] };
+    p.parts.push(part);
+    return part;
+  }
+  let g = new Geo();
+  g.box(0, 0, 0, 0.46, 0.58, 0.28, cfg.jacket);
+  add(g, 0, 1.16, 0);
+
+  g = new Geo();
+  g.box(0, 0, 0, 0.23, 0.26, 0.23, cfg.skin);
+  g.box(0, 0.145, 0, 0.25, 0.06, 0.25, cfg.hair);
+  g.box(0, 0.02, -0.095, 0.24, 0.22, 0.06, cfg.hair);
+  g.box(0, -0.17, 0, 0.1, 0.14, 0.1, cfg.skin);
+  if (cfg.cap) { g.box(0, 0.17, 0.02, 0.27, 0.06, 0.3, cfg.cap); g.box(0, 0.155, 0.17, 0.24, 0.03, 0.12, cfg.cap); }
+  add(g, 0, 1.6, 0);
+
+  g = new Geo();
+  g.box(-0.12, 0.98, -0.18, 0.2, 0.24, 0.09, cfg.bag);
+  add(g, 0, 0, 0);
+
+  for (const s of [-1, 1]) {
+    g = new Geo();
+    g.box(0, -0.34, 0, 0.17, 0.68, 0.2, cfg.pants);
+    g.box(0, -0.72, 0.04, 0.19, 0.11, 0.29, cfg.shoe);
+    const leg = add(g, s * 0.12, 0.78, 0);
+    if (s < 0) p.legL = leg; else p.legR = leg;
+  }
+  for (const s of [-1, 1]) {
+    g = new Geo();
+    g.box(0, -0.24, 0, 0.13, 0.48, 0.15, cfg.jacket);
+    g.box(0, -0.52, 0, 0.1, 0.12, 0.12, cfg.skin);
+    const arm = add(g, s * 0.3, 1.38, 0);
+    if (s < 0) p.armL = arm; else p.armR = arm;
+  }
+  if (cfg.longHair) {
+    g = new Geo(); g.box(0, 0.04, -0.13, 0.24, 0.34, 0.1, cfg.hair); add(g, 0, 1.55, 0);
+  }
+  return p;
+}
+
+function animPerson(p, speed, dt) {
+  p.phase += speed * 2.4 * dt;
+  const amp = clamp(speed / 6, 0, 1) * 0.62;
+  const s = Math.sin(p.phase) * amp;
+  if (p.legL) p.legL.rot[0] = s;
+  if (p.legR) p.legR.rot[0] = -s;
+  if (p.armL) p.armL.rot[0] = -s * 0.75;
+  if (p.armR) p.armR.rot[0] = s * 0.75;
+}
+
+function drawPerson(p, x, y, z, rotY) {
+  const root = m4trs(x, y, z, 0, rotY, 0, 1, 1, 1);
+  for (let i = 0; i < p.parts.length; i++) {
+    const part = p.parts[i];
+    const local = m4trs(part.pos[0], part.pos[1], part.pos[2], part.rot[0], part.rot[1], part.rot[2], 1, 1, 1);
+    drawMesh(part.m, m4mul(root, local), false, 1);
+  }
+}
+
+/* ---------------- 游戏状态 ---------------- */
+let started = false;
+let fly = false;
+let riding = false;
+var TOWN_Y = null;
+var TOWN_X0 = null, TOWN_X1 = null;
+var bball = { active: false, phase: 'idle', score: 0, shots: 0, max: 8, power: 0, dir: 1, charging: false, ball: null, result: '', wait: 0, made: false };
+var bballMesh = null;
+var COURT = { x: 0, z: 312, by: 0 };
+var playerHp = 100, maxHp = 100, weapon = 1, ammo = 8, maxAmmo = 8, reloadT = 0, atkCd = 0, swingT = 0, hurtT = 0;
+var mobs = [], mobTimer = 2.5, dead = false, respawnT = 0;
+var dogMesh = null, swordMesh = null, gunMesh = null;
+var helpCooldown = 0;
+var cloudMesh = null;
+var clouds = [];
+var musicOn = true, actx = null, mBus = null, mMaster = null, mStep = 0, mNext = 0, mTimer = null;
+var M_SCALE = [0, 3, 5, 7, 10, 12, 15, 17];
+var M_PAT = [0, -1, 2, 3, -1, 1, 4, -1, 3, 2, -1, 1, 0, -1, -1, -1];
+let bikeMesh = null;
+let walkDist = 0;
+const flyPos = [0, 0, 0];
+let flyYaw = 0, flyPitch = 0.35;
+const player = {
+  x: 2, z: 26, y: 0, vx: 0, vz: 0, jy: 0, vy: 0,
+  rot: Math.PI / 2, phase: 0, onGround: true, model: null
+};
+const cam = { yaw: 0, pitch: 0.26, dist: 6.4, eye: [0, 0, 0], target: [0, 0, 0], intro: 2.35 };
+const keys = {};
+const joy = { x: 0, y: 0, active: false };
+let lookId = null, lookX = 0, lookY = 0;
+let mouseDown = false, mouseX = 0, mouseY = 0;
+let time = 0;
+
+const npcs = [];
+const shadowSpots = [];
+
+/* ---------------- 交互点 ---------------- */
+function buildPois() {
+  pois.push({ x: -44, z: 8, r: 6.5, name: '孙玉厚家', line: '窑里飘出玉米面糊糊的味道。' });
+  pois.push({ x: -34, z: 26, r: 7, name: '大队部', line: '喇叭里正放着秦腔，唱到苦处，弦子拉得更低了。' });
+  pois.push({ x: 24, z: 48, r: 8, name: '龙王庙 · 学校', line: '大殿改成了教室，黑板就挂在龙王爷的位上。' });
+
+  pois.push({ x: 28, z: 44, r: 6, name: '枣树林', line: '枣子还没红，酸得倒牙。' });
+  pois.push({ x: 46, z: -6, r: 6, name: '金波家', line: '院里停着一辆飞鸽自行车，擦得锃亮。' });
+  pois.push({ x: -22, z: 30, r: 6, name: '公路', line: '往南十里是石圪节，往北三十里是米家镇。' });
+  pois.push({ x: -36, z: 14, r: 4, name: '井台', line: '井水凉，照得见人影。' });
+  pois.push({ x: 20, z: creekZ(20), r: 4, name: '哭咽河口', line: '水从石头上漫过去，凉得刺骨。' });
+  pois.push({ x: 50, z: 92, r: 9, name: '庙坪山', line: '站在山顶，能看见雾里的原西县城。' });
+  pois.push({ x: -48, z: 148, r: 8, name: '罐子村', line: '兰花的窑塌了半边，院里晒着红枣。' });
+  pois.push({ x: roadX(342) + 8, z: 312, r: 13, name: '篮球场', line: '水泥球场，篮板是木头的。按 E 投篮。' });
+  pois.push({ x: -46, z: 184, r: 8, name: '石圪节公社', line: '往南五十里，就是原西县城。' });
+  pois.push({ x: -22, z: 342, r: 14, name: '原西县城', line: '青石板街，十字街口，中学在陡坡上面。' });
+  pois.push({ x: -33, z: 264, r: 5, name: '二十五里铺', line: '茶棚里一碗热水，歇歇脚再走。' });
+  pois.push({ x: 100, z: creekZ(100), r: 9, name: '哭咽河大坝', line: '坝面上刻着“高峡出平湖”，字被雨水冲得发白。' });
+  pois.push({ x: 60, z: -34, r: 6, name: '金俊山家', line: '那头奶牛正卧在槽边，慢条斯理地反刍。' });
+}
+
+/* ---------------- 初始化世界 ---------------- */
+let terrainMesh2 = null, worldMesh2 = null, waterMesh2 = null, skyMesh2 = null;
+let shadowMesh = null, sunMesh = null;
+
+function buildWorld() {
+  buildRoad();
+  buildDamAndBridges();
+  buildVillage();
+  buildLandscape();
+  buildMountains();
+  buildProps();
+}
+
+function initActors() {
+  player.model = makePerson({
+    jacket: C('#4c6473'), pants: C('#33302a'), skin: C('#b9855e'),
+    hair: C('#241a14'), shoe: C('#2a2420'), bag: C('#8a6f47')
+  });
+  player.y = groundH(player.x, player.z);
+
+  const cast = [
+    ['孙少安', -44, 6, '#4c6473', '#33302a', '#b9855e', '#241a14', false],
+    ['贺秀莲', -42, 4, '#8b4b3c', '#4a4038', '#c08f68', '#1c1510', true],
+    ['孙少平', -46, 10, '#3f4d5a', '#2f2b26', '#b07c55', '#2a2018', false],
+    ['孙玉厚', -44, 8, '#3c3a34', '#2b2823', '#a97b56', '#cdbfa6', false],
+    ['孙玉亭', -54, -22, '#4a4034', '#2f2b26', '#b9855e', '#1f1812', false],
+    ['田福堂', -40, -16, '#4f5c3f', '#3a3a30', '#b9855e', '#1f1812', false],
+    ['田润叶', -38, -14, '#7a4a3c', '#4a4038', '#c08f68', '#1c1510', true],
+    ['田润生', -42, -18, '#5a5145', '#3b3630', '#b07c55', '#2a2018', false],
+    ['田晓霞', 28, 30, '#6b4a5a', '#3a3038', '#c08f68', '#1c1510', true],
+    ['金俊武', 58, 12, '#4f5c3f', '#3a3a30', '#b9855e', '#1f1812', false],
+    ['金俊文', 72, -6, '#3f4d5a', '#2f2b26', '#b07c55', '#2a2018', false],
+    ['金波', 46, -8, '#4a5a6a', '#33302a', '#b9855e', '#241a14', false],
+    ['金光亮', 78, 26, '#5a4a3a', '#332e28', '#b07c55', '#1f1812', false],
+    ['金俊斌', 62, 24, '#4a4034', '#2f2b26', '#b9855e', '#241a14', false],
+    ['田海民', -52, 58, '#3c4a3a', '#2b2823', '#a97b56', '#2a2018', false],
+    ['兰花', -48, 148, '#8b4b3c', '#4a4038', '#c08f68', '#1c1510', true]
+  ];
+  for (let i = 0; i < cast.length; i++) {
+    const c = cast[i];
+    npcs.push({
+      name: c[0],
+      model: makePerson({
+        jacket: C(c[3]), pants: C(c[4]), skin: C(c[5]), hair: C(c[6]),
+        shoe: C('#2a2420'), bag: C('#6f5a3c'), longHair: c[7]
+      }),
+      home: { x: c[1], z: c[2] },
+      x: c[1], z: c[2], y: groundH(c[1], c[2]), rot: 0,
+      speed: 1.15 + (i % 4) * 0.12,
+      wp: { x: c[1], z: c[2] }, wait: 0.5 + Math.random() * 2,
+      helpT: 0, atkCd: 0
+    });
+  }
+}
+
+/* ---------------- 输入 ---------------- */
+function bindInput() {
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].indexOf(e.code) >= 0) e.preventDefault();
+    if (bball.active) {
+      if (e.code === 'Escape') exitBasket();
+      else if (e.code === 'Space') { if (bball.phase === 'aim') bball.charging = true; else if (bball.phase === 'over') exitBasket(); }
+      else if (e.code === 'KeyE' && bball.phase === 'over') exitBasket();
+      return;
+    }
+    keys[e.code] = true;
+    if (e.code === 'KeyE' && started) interact();
+    if (e.code === 'KeyJ' && started) attack();
+    if (e.code === 'Digit1' && started) setWeapon(1);
+    if (e.code === 'Digit2' && started) setWeapon(2);
+    if (e.code === 'KeyR' && started) reload();
+    if (e.code === 'KeyN' && started) toggleDayCycle();
+    if (e.code === 'KeyM' && started) toggleMusic();
+    if (e.code === 'KeyF' && started) { e.preventDefault(); toggleFly(); }
+    if (e.code === 'KeyB' && started) { e.preventDefault(); toggleBike(); }
+    if (e.code === 'Space' && started && !fly && !riding && player.onGround) {
+      player.vy = 5.4; player.onGround = false;
+    }
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; if (e.code === 'Space' && bball.active && bball.charging) shootBall(); });
+
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse') {
+      mouseDown = true; mouseX = e.clientX; mouseY = e.clientY;
+      canvas.classList.add('dragging');
+    } else {
+      lookId = e.pointerId; lookX = e.clientX; lookY = e.clientY;
+    }
+  });
+  window.addEventListener('pointermove', (e) => {
+    if (e.pointerType === 'mouse') {
+      if (!mouseDown) return;
+      const dx = e.clientX - mouseX, dy = e.clientY - mouseY;
+      mouseX = e.clientX; mouseY = e.clientY;
+      if (fly) {
+        flyYaw -= dx * 0.0042;
+        flyPitch = clamp(flyPitch - dy * 0.0032, -1.25, 1.25);
+      } else {
+        cam.yaw -= dx * 0.0042;
+        cam.pitch = clamp(cam.pitch + dy * 0.0032, 0.03, 1.28);
+      }
+    } else if (e.pointerId === lookId) {
+      const dx = e.clientX - lookX, dy = e.clientY - lookY;
+      lookX = e.clientX; lookY = e.clientY;
+      if (fly) {
+        flyYaw -= dx * 0.006;
+        flyPitch = clamp(flyPitch - dy * 0.0045, -1.25, 1.25);
+      } else {
+        cam.yaw -= dx * 0.006;
+        cam.pitch = clamp(cam.pitch + dy * 0.0045, 0.03, 1.28);
+      }
+    }
+  });
+  window.addEventListener('pointerup', (e) => {
+    if (e.pointerType === 'mouse') { mouseDown = false; canvas.classList.remove('dragging'); }
+    if (e.pointerId === lookId) lookId = null;
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    cam.dist = clamp(cam.dist * (1 + e.deltaY * 0.0012), 2.8, 15);
+  }, { passive: false });
+
+  // 摇杆
+  const joyEl = document.getElementById('joy');
+  const knob = document.getElementById('knob');
+  let joyId = null, joyCX = 0, joyCY = 0;
+  function moveJoy(e) {
+    let dx = e.clientX - joyCX, dy = e.clientY - joyCY;
+    const l = Math.hypot(dx, dy) || 1;
+    const m = Math.min(l, 52);
+    dx = dx / l * m; dy = dy / l * m;
+    knob.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+    joy.x = dx / 52; joy.y = dy / 52;
+  }
+  joyEl.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return;
+    e.preventDefault();
+    joyId = e.pointerId;
+    try { joyEl.setPointerCapture(e.pointerId); } catch (err) {}
+    const r = joyEl.querySelector('.base').getBoundingClientRect();
+    joyCX = r.left + r.width / 2; joyCY = r.top + r.height / 2;
+    joy.active = true;
+    moveJoy(e);
+  });
+  joyEl.addEventListener('pointermove', (e) => { if (e.pointerId === joyId) moveJoy(e); });
+  function endJoy(e) {
+    if (e.pointerId !== joyId) return;
+    joyId = null; joy.active = false; joy.x = 0; joy.y = 0;
+    knob.style.transform = 'translate(0,0)';
+  }
+  joyEl.addEventListener('pointerup', endJoy);
+  joyEl.addEventListener('pointercancel', endJoy);
+
+  document.getElementById('actBtn').addEventListener('click', () => { if (started) interact(); });
+}
+
+/* ---------------- 交互 ---------------- */
+let toastTimer = null;
+function toast(text) {
+  const el = document.getElementById('toast');
+  el.textContent = text;
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), 3800);
+}
+
+function nearestPoi() {
+  let best = null, bd = 1e9;
+  const px = fly ? flyPos[0] : player.x;
+  const pz = fly ? flyPos[2] : player.z;
+  for (let i = 0; i < pois.length; i++) {
+    const p = pois[i];
+    const d = Math.hypot(px - p.x, pz - p.z);
+    if (d < p.r && d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+
+function interact() {
+  const p = nearestPoi();
+  if (!p) return;
+  if (p.name === '篮球场') { startBasket(); return; }
+  toast(p.line);
+}
+
+function startBasket() {
+  if (!started || bball.active) return;
+  if (fly) toggleFly();
+  if (riding) toggleBike();
+  bball.active = true;
+  bball.phase = 'aim';
+  bball.score = 0; bball.shots = 0; bball.power = 0; bball.dir = 1;
+  bball.charging = false; bball.ball = null; bball.result = '';
+  player.x = COURT.x; player.z = 312.7;
+  player.y = groundH(player.x, player.z);
+  player.rot = Math.PI;
+  player.model.armL.rot[0] = -2.2;
+  player.model.armR.rot[0] = -2.2;
+  document.getElementById('bball').classList.add('on');
+  updateBasketHud();
+}
+
+function exitBasket() {
+  bball.active = false; bball.phase = 'idle';
+  document.getElementById('bball').classList.remove('on');
+  player.model.armL.rot[0] = 0;
+  player.model.armR.rot[0] = 0;
+  cam.yaw = Math.PI; cam.dist = 7.6;
+}
+
+function shootBall() {
+  if (bball.phase !== 'aim' || !bball.charging) return;
+  bball.charging = false;
+  bball.phase = 'fly';
+  bball.shots++;
+  const v = 3.8 + bball.power * 6.0;
+  bball.ball = { x: COURT.x, y: COURT.by + 2.0, z: COURT.z + 0.3, vx: 0, vy: v * 0.819, vz: -v * 0.574, spin: 0, t: 0 };
+  bball.made = false;
+  bball.result = '';
+  updateBasketHud();
+}
+
+function updateBasketHud() {
+  document.getElementById('bbScore').textContent = bball.score;
+  document.getElementById('bbShot').textContent = Math.min(bball.shots + 1, bball.max);
+  document.getElementById('bbPower').style.width = (bball.power * 100) + '%';
+  const tip = document.getElementById('bbTip');
+  if (bball.phase === 'over') tip.textContent = '结束，' + bball.score + ' 分 · 按 Esc 退出';
+  else if (bball.phase === 'result') tip.textContent = bball.result;
+  else tip.textContent = '按住空格蓄力，松开投篮 · Esc 退出';
+  document.getElementById('bbBtn').textContent = bball.phase === 'over' ? '退出' : '按住蓄力';
+}
+
+function updateBasket(dt) {
+  const rimZ = COURT.z - 4.4, rimY = COURT.by + 3.05;
+  if (bball.phase === 'aim') {
+    if (bball.charging) {
+      bball.power += bball.dir * dt * 0.6;
+      if (bball.power >= 1) { bball.power = 1; bball.dir = -1; }
+      if (bball.power <= 0) { bball.power = 0; bball.dir = 1; }
+    }
+  } else if (bball.phase === 'fly') {
+    const b = bball.ball;
+    b.t += dt;
+    b.vy -= 7.0 * dt;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+    b.spin += dt * 7;
+    const dxr = b.x - COURT.x, dzr = b.z - rimZ;
+    const dr = Math.sqrt(dxr * dxr + dzr * dzr);
+
+    // 篮板反弹（篮板在篮圈后 0.55 米）
+    if (b.vz < 0 && b.z <= rimZ - 0.55 && b.z > rimZ - 1.2) {
+      const dy = b.y - (COURT.by + 3.75);
+      if (Math.abs(b.x - COURT.x) < 1.0 && Math.abs(dy) < 0.7) {
+        b.z = rimZ - 0.55;
+        b.vz = Math.abs(b.vz) * 0.55;
+        b.vx += (b.x - COURT.x) * 1.5;
+        b.vy *= 0.8;
+        bball.result = '打板';
+      }
+    }
+
+    // 篮圈碰撞
+    if (Math.abs(b.y - rimY) < 0.12 && dr > 0.27 && dr < 0.43) {
+      const nx = dxr / (dr || 1), nz = dzr / (dr || 1);
+      const vn = b.vx * nx + b.vz * nz;
+      if (vn < 0) {
+        b.vx -= 1.7 * vn * nx;
+        b.vz -= 1.7 * vn * nz;
+        b.vx *= 0.72; b.vz *= 0.72;
+        b.vy = Math.abs(b.vy) * 0.35;
+        bball.result = '打铁';
+      }
+    }
+
+    // 进球：从篮圈圆柱里落下
+    if (!bball.made && b.vy < 0 && dr < 0.35 && b.y < rimY + 0.05 && b.y > rimY - 0.45) {
+      bball.made = true;
+      bball.score++;
+      bball.result = '进了！';
+    }
+
+    // 地面弹跳
+    if (b.y < COURT.by + 0.14) {
+      b.y = COURT.by + 0.14;
+      b.vy = -b.vy * 0.6;
+      b.vx *= 0.7;
+      b.vz *= 0.7;
+    }
+
+    const settled = b.y <= COURT.by + 0.15 && Math.abs(b.vy) < 0.6 && b.t > 0.7;
+    if (settled || b.t > 5) {
+      if (!bball.made) bball.result = bball.result || '没进';
+      bball.phase = 'result';
+      bball.wait = 1.2;
+    }
+  } else if (bball.phase === 'result') {
+    bball.wait -= dt;
+    if (bball.wait <= 0) {
+      if (bball.shots >= bball.max) bball.phase = 'over';
+      else { bball.phase = 'aim'; bball.power = 0; bball.dir = 1; bball.ball = null; }
+    }
+  }
+  updateBasketHud();
+}
+
+/* ---------------- 更新 ---------------- */
+function updatePlayer(dt) {
+  let fwd = 0, strafe = 0;
+  if (keys.KeyW || keys.ArrowUp) fwd += 1;
+  if (keys.KeyS || keys.ArrowDown) fwd -= 1;
+  if (keys.KeyD || keys.ArrowRight) strafe += 1;
+  if (keys.KeyA || keys.ArrowLeft) strafe -= 1;
+  if (joy.active) { fwd += -joy.y; strafe += joy.x; }
+  fwd = clamp(fwd, -1, 1); strafe = clamp(strafe, -1, 1);
+  const mag = Math.hypot(fwd, strafe);
+  if (mag > 1) { fwd /= mag; strafe /= mag; }
+
+  const sy = Math.sin(cam.yaw), cy = Math.cos(cam.yaw);
+  const fx = -sy, fz = -cy;
+  const rx = cy, rz = -sy;
+  const dirX = fx * fwd + rx * strafe;
+  const dirZ = fz * fwd + rz * strafe;
+
+  const g0 = groundH(player.x, player.z);
+  const wading = g0 < WATER_Y - 0.12;
+  const run = keys.ShiftLeft || keys.ShiftRight;
+  const targetSpeed = (riding ? (run ? 16 : 10.5) : (run ? 8.8 : 4.9)) * (wading ? 0.55 : 1);
+  const k = 1 - Math.exp(-13 * dt);
+  player.vx = lerp(player.vx, dirX * targetSpeed, k);
+  player.vz = lerp(player.vz, dirZ * targetSpeed, k);
+
+  let nx = player.x + player.vx * dt;
+  let nz = player.z + player.vz * dt;
+
+  // 坡度阻挡（允许沿墙滑动）
+  const gx = groundH(nx, player.z);
+  if (gx - g0 > 1.15 && player.onGround) { nx = player.x; player.vx *= 0.2; }
+  const gz = groundH(nx, nz);
+  if (gz - groundH(nx, player.z) > 1.15 && player.onGround) { nz = player.z; player.vz *= 0.2; }
+
+  // 建筑/树碰撞
+  for (let i = 0; i < colliders.length; i++) {
+    const c = colliders[i];
+    const dx = nx - c.x, dz = nz - c.z;
+    const d = Math.hypot(dx, dz);
+    const rr = c.r + 0.42;
+    if (d < rr && d > 0.0001) {
+      nx = c.x + dx / d * rr;
+      nz = c.z + dz / d * rr;
+    }
+  }
+
+  nx = clamp(nx, -325, 325);
+  nz = clamp(nz, -330, 470);
+  player.x = nx; player.z = nz;
+
+  // 跳跃
+  if (!player.onGround) {
+    player.jy += player.vy * dt;
+    player.vy -= 15 * dt;
+    if (player.jy <= 0) { player.jy = 0; player.vy = 0; player.onGround = true; }
+  }
+
+  const gh = groundH(player.x, player.z);
+  player.y = gh + player.jy;
+
+  const sp = Math.hypot(player.vx, player.vz);
+  if (sp > 0.25) {
+    const target = Math.atan2(player.vx, player.vz);
+    let diff = target - player.rot;
+    while (diff > Math.PI) diff -= TAU;
+    while (diff < -Math.PI) diff += TAU;
+    player.rot += diff * (1 - Math.exp(-12 * dt));
+  }
+  if (riding) {
+    player.model.legL.rot[0] = 1.15;
+    player.model.legR.rot[0] = 1.15;
+    player.model.armL.rot[0] = -0.75;
+    player.model.armR.rot[0] = -0.75;
+    player.model.parts[0].rot[0] = 0.12;
+    player.y = gh + 0.14;
+  } else {
+    player.model.parts[0].rot[0] = 0;
+    animPerson(player.model, sp, dt);
+  }
+}
+
+function pickNpcWp(n) {
+  for (let i = 0; i < 10; i++) {
+    const x = n.home.x + (Math.random() * 2 - 1) * 15;
+    const z = n.home.z + (Math.random() * 2 - 1) * 15;
+    if (groundH(x, z) < WATER_Y) continue;
+    n.wp.x = x; n.wp.z = z;
+    return;
+  }
+}
+
+function alertHelpers() {
+  if (helpCooldown > 0) return;
+  helpCooldown = 1.2;
+  for (const n of npcs) {
+    if (Math.hypot(n.x - player.x, n.z - player.z) < 24) n.helpT = 12;
+  }
+}
+
+function updateNpcs(dt) {
+  const day = SUN_DIR[1] > -0.02;
+  if (helpCooldown > 0) helpCooldown -= dt;
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    n.y = groundH(n.x, n.z);
+    if (n.helpT > 0) {
+      n.helpT -= dt;
+      let target = null, bd = 1e9;
+      for (const m of mobs) {
+        const d = Math.hypot(m.x - n.x, m.z - n.z);
+        if (d < 30 && d < bd) { bd = d; target = m; }
+      }
+      if (target) {
+        const dx = target.x - n.x, dz = target.z - n.z, d = bd || 1;
+        if (d > 1.5) {
+          n.x += dx / d * 3.2 * dt; n.z += dz / d * 3.2 * dt;
+          n.rot = Math.atan2(dx, dz);
+          animPerson(n.model, 3.2, dt);
+        } else {
+          n.rot = Math.atan2(dx, dz);
+          n.atkCd -= dt;
+          if (n.atkCd <= 0) { target.hp -= 18; n.atkCd = 1.1; n.model.armR.rot[0] = -2.0; }
+          animPerson(n.model, 0, dt);
+        }
+      } else {
+        n.helpT = 0;
+      }
+    } else if (!day) {
+      const dx = n.home.x - n.x, dz = n.home.z - n.z, d = Math.hypot(dx, dz);
+      if (d > 1.2) {
+        n.x += dx / d * 1.4 * dt; n.z += dz / d * 1.4 * dt;
+        n.rot = Math.atan2(dx, dz);
+        animPerson(n.model, 1.4, dt);
+      } else {
+        animPerson(n.model, 0, dt);
+        n.model.parts[1].rot[1] = Math.sin(time * 0.6 + i) * 0.1;
+      }
+    } else if (n.wait > 0) {
+      n.wait -= dt;
+      animPerson(n.model, 0, dt);
+      n.model.parts[1].rot[1] = Math.sin(time * 0.6 + i) * 0.12;
+    } else {
+      const dx = n.wp.x - n.x, dz = n.wp.z - n.z, d = Math.hypot(dx, dz);
+      if (d < 0.8) {
+        pickNpcWp(n);
+        n.wait = 1 + Math.random() * 3.5;
+      } else {
+        n.x += dx / d * n.speed * dt; n.z += dz / d * n.speed * dt;
+        n.rot = Math.atan2(dx, dz);
+        animPerson(n.model, n.speed, dt);
+      }
+    }
+  }
+}
+
+/* ---------------- 相机 ---------------- */
+function updateCamera(dt) {
+  if (bball.active) {
+    cam.eye[0] = COURT.x; cam.eye[1] = COURT.by + 2.75; cam.eye[2] = COURT.z + 3.2;
+    cam.target[0] = COURT.x; cam.target[1] = COURT.by + 3.0; cam.target[2] = COURT.z - 4.4;
+    return;
+  }
+  if (fly) {
+    cam.eye[0] = flyPos[0]; cam.eye[1] = flyPos[1]; cam.eye[2] = flyPos[2];
+    const cp = Math.cos(flyPitch), sp = Math.sin(flyPitch);
+    cam.target[0] = flyPos[0] - Math.sin(flyYaw) * cp * 20;
+    cam.target[1] = flyPos[1] + sp * 20;
+    cam.target[2] = flyPos[2] - Math.cos(flyYaw) * cp * 20;
+    return;
+  }
+  if (!started) {
+    cam.intro += dt * 0.055;
+    const r = 88, h = 42;
+    const ex = Math.cos(cam.intro) * r;
+    const ez = Math.sin(cam.intro) * r + 8;
+    cam.eye = [ex, h, ez];
+    cam.target = [0, 3, 8];
+    return;
+  }
+  const tx = player.x, ty = player.y + 1.35, tz = player.z;
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  let d = cam.dist;
+  // 不要让镜头穿过山、窑洞或房子（整条视线都检查）
+  for (let i = 0; i < 16; i++) {
+    let blocked = false;
+    for (let s = 0.25; s <= 1.001; s += 0.15) {
+      const sx = tx + Math.sin(cam.yaw) * cp * d * s;
+      const sz = tz + Math.cos(cam.yaw) * cp * d * s;
+      const sy = ty + sp * d * s;
+      if (sy < groundH(sx, sz) + 0.42) { blocked = true; break; }
+      for (let j = 0; j < colliders.length; j++) {
+        const c = colliders[j];
+        if (!c.tall) continue;
+        if (Math.hypot(sx - c.x, sz - c.z) < c.r * 0.85 && sy < groundH(c.x, c.z) + 5.4) { blocked = true; break; }
+      }
+      if (blocked) break;
+    }
+    if (blocked) d *= 0.86; else break;
+  }
+  if (d < 1.6) d = 1.6;
+  const ex = tx + Math.sin(cam.yaw) * cp * d;
+  const ey = ty + sp * d;
+  const ez = tz + Math.cos(cam.yaw) * cp * d;
+  const k = 1 - Math.exp(-12 * dt);
+  cam.eye[0] = lerp(cam.eye[0], ex, k);
+  cam.eye[1] = lerp(cam.eye[1], ey, k);
+  cam.eye[2] = lerp(cam.eye[2], ez, k);
+  cam.target[0] = lerp(cam.target[0], tx, k);
+  cam.target[1] = lerp(cam.target[1], ty, k);
+  cam.target[2] = lerp(cam.target[2], tz, k);
+}
+
+/* ---------------- HUD ---------------- */
+let lastZone = '';
+function zoneAt(x, z) {
+  if (z < -100) return ['东拉河', '上游'];
+  if (x < -26) return ['田家圪崂', '坡上的窑洞'];
+  if (x > 30) return ['金家湾', '川道里的砖房'];
+  if (z > 26 && x > 2) return ['庙坪', '龙王庙 · 枣树林'];
+  if (Math.abs(x - riverX(z)) < 16) return ['东拉河', '过河石'];
+  return ['双水村', '公路'];
+}
+function updateHud() {
+  const zn = zoneAt(player.x, player.z);
+  if (zn[0] !== lastZone) {
+    lastZone = zn[0];
+    document.getElementById('zoneName').textContent = zn[0];
+    document.getElementById('zoneSub').textContent = zn[1];
+  }
+  const p = nearestPoi();
+  const pr = document.getElementById('prompt');
+  if (p) {
+    document.getElementById('promptText').textContent = (p.name === '篮球场' ? '投篮 · ' : '看看 · ') + p.name;
+    pr.classList.add('on');
+  } else {
+    pr.classList.remove('on');
+  }
+}
+
+/* ---------------- 地名标签 ---------------- */
+let labelEls = [];
+let npcLabelEls = [];
+let lastVP = null, lastEye = [0, 0, 0];
+
+function initLabels() {
+  const box = document.getElementById('labels');
+  for (let i = 0; i < landmarks.length; i++) {
+    const l = landmarks[i];
+    const el = document.createElement('div');
+    el.className = 'lbl3d';
+    el.innerHTML = '<i></i>' + l.name;
+    box.appendChild(el);
+    labelEls.push({ el: el, l: l });
+  }
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    const el = document.createElement('div');
+    el.className = 'lbl3d npc';
+    el.innerHTML = '<i></i>' + n.name;
+    box.appendChild(el);
+    npcLabelEls.push({ el: el, n: n });
+  }
+}
+
+function updateLabels() {
+  if (!lastVP || !started) {
+    for (let i = 0; i < labelEls.length; i++) labelEls[i].el.style.opacity = 0;
+    return;
+  }
+  const w = window.innerWidth, h = window.innerHeight, m = lastVP;
+  const list = [];
+  for (let i = 0; i < labelEls.length; i++) {
+    const it = labelEls[i], l = it.l;
+    const wy = terrainH(l.x, l.z) + l.h;
+    const dist = Math.hypot(l.x - lastEye[0], wy - lastEye[1], l.z - lastEye[2]);
+    if (dist > 75 || dist < 6) { it.el.style.opacity = 0; continue; }
+    const cx = m[0] * l.x + m[4] * wy + m[8] * l.z + m[12];
+    const cy = m[1] * l.x + m[5] * wy + m[9] * l.z + m[13];
+    const cw = m[3] * l.x + m[7] * wy + m[11] * l.z + m[15];
+    if (cw <= 0.1) { it.el.style.opacity = 0; continue; }
+    const nx = cx / cw, ny = cy / cw;
+    if (nx < -1.05 || nx > 1.05 || ny < -1.05 || ny > 1.05) { it.el.style.opacity = 0; continue; }
+    list.push({ it: it, nx: nx, ny: ny, d: dist });
+  }
+  list.sort(function (a, b) { return a.d - b.d; });
+  for (let i = 0; i < list.length; i++) {
+    if (i >= 7) { list[i].it.el.style.opacity = 0; continue; }
+    const o = list[i];
+    o.it.el.style.left = ((o.nx * 0.5 + 0.5) * w) + 'px';
+    o.it.el.style.top = ((-o.ny * 0.5 + 0.5) * h) + 'px';
+    o.it.el.style.opacity = String(clamp(1.2 - o.d / 75, 0.3, 1));
+  }
+  const nlist = [];
+  for (let i = 0; i < npcLabelEls.length; i++) {
+    const it = npcLabelEls[i], n = it.n;
+    const wy = n.y + 2.05;
+    const dist = Math.hypot(n.x - lastEye[0], wy - lastEye[1], n.z - lastEye[2]);
+    if (dist > 36 || dist < 2) { it.el.style.opacity = 0; continue; }
+    const cx = m[0] * n.x + m[4] * wy + m[8] * n.z + m[12];
+    const cy = m[1] * n.x + m[5] * wy + m[9] * n.z + m[13];
+    const cw = m[3] * n.x + m[7] * wy + m[11] * n.z + m[15];
+    if (cw <= 0.1) { it.el.style.opacity = 0; continue; }
+    const nx = cx / cw, ny = cy / cw;
+    if (nx < -1.05 || nx > 1.05 || ny < -1.05 || ny > 1.05) { it.el.style.opacity = 0; continue; }
+    nlist.push({ it: it, nx: nx, ny: ny, d: dist });
+  }
+  nlist.sort(function (a, b) { return a.d - b.d; });
+  for (let i = 0; i < nlist.length; i++) {
+    if (i >= 8) { nlist[i].it.el.style.opacity = 0; continue; }
+    const o = nlist[i];
+    o.it.el.style.left = ((o.nx * 0.5 + 0.5) * w) + 'px';
+    o.it.el.style.top = ((-o.ny * 0.5 + 0.5) * h) + 'px';
+    o.it.el.style.opacity = String(clamp(1.1 - o.d / 40, 0.35, 1));
+  }
+}
+
+/* ---------------- 小地图 ---------------- */
+const MAP_X0 = -100, MAP_X1 = 110, MAP_Z0 = -140, MAP_Z1 = 210, MAP_S = 240;
+function mmx(x) { return (x - MAP_X0) / (MAP_X1 - MAP_X0) * MAP_S; }
+function mmz(z) { return (z - MAP_Z0) / (MAP_Z1 - MAP_Z0) * MAP_S; }
+let mapBase = null;
+
+function buildMinimapBase() {
+  const c = document.createElement('canvas');
+  c.width = MAP_S; c.height = MAP_S;
+  const g = c.getContext('2d');
+  // 地形底色
+  for (let py = 0; py < MAP_S; py += 2) {
+    for (let px = 0; px < MAP_S; px += 2) {
+      const x = MAP_X0 + (px + 1) / MAP_S * (MAP_X1 - MAP_X0);
+      const z = MAP_Z0 + (py + 1) / MAP_S * (MAP_Z1 - MAP_Z0);
+      const h = terrainH(x, z);
+      let col;
+      if (h < WATER_Y + 0.05) col = '#8fc6cf';
+      else if (h < 2) col = '#d9d3a9';
+      else if (h < 6) col = '#cfc08f';
+      else if (h < 12) col = '#bca97a';
+      else col = '#a89466';
+      g.fillStyle = col;
+      g.fillRect(px, py, 2, 2);
+    }
+  }
+
+  // 田地
+  const fields = [[86, -8, 20, 14], [92, 12, 18, 12], [84, 34, 16, 12], [70, 52, 14, 10], [-78, -18, 14, 9], [-84, 6, 12, 9], [20, 110, 22, 14], [34, 104, 18, 12]];
+  g.fillStyle = 'rgba(214, 196, 110, .55)';
+  for (const f of fields) g.fillRect(mmx(f[0] - f[2] / 2), mmz(f[1] - f[3] / 2), f[2] / (MAP_X1 - MAP_X0) * MAP_S, f[3] / (MAP_Z1 - MAP_Z0) * MAP_S);
+
+  // 村子色块
+  g.fillStyle = 'rgba(226, 205, 120, .3)';
+  g.beginPath(); g.ellipse(mmx(-44), mmz(14), 34, 52, -0.1, 0, TAU); g.fill();
+  g.beginPath(); g.ellipse(mmx(66), mmz(8), 32, 46, -0.1, 0, TAU); g.fill();
+
+  // 东拉河
+  g.strokeStyle = '#4f9fae'; g.lineWidth = 4; g.lineCap = 'round';
+  g.beginPath();
+  for (let z = MAP_Z0; z <= MAP_Z1; z += 4) {
+    const x = mmx(riverX(z)), y = mmz(z);
+    if (z === MAP_Z0) g.moveTo(x, y); else g.lineTo(x, y);
+  }
+  g.stroke();
+  // 哭咽河
+  g.strokeStyle = '#4f9fae'; g.lineWidth = 2.6;
+  g.beginPath();
+  for (let x = 8; x <= 112; x += 4) {
+    const px = mmx(x), py = mmz(creekZ(x));
+    if (x === 8) g.moveTo(px, py); else g.lineTo(px, py);
+  }
+  g.stroke();
+  // 公路
+  g.strokeStyle = '#b08a58'; g.lineWidth = 3; g.setLineDash([5, 4]);
+  g.beginPath();
+  for (let z = MAP_Z0; z <= MAP_Z1; z += 4) {
+    const px = mmx(roadX(z)), py = mmz(z);
+    if (z === MAP_Z0) g.moveTo(px, py); else g.lineTo(px, py);
+  }
+  g.stroke();
+  g.setLineDash([]);
+
+  // 关键地点
+  const spots = [
+    [-36, 26, '大队部', 'public'], [-44, 72, '饲养室', 'public'], [-30, 52, '打谷场', 'public'], [2, 86, '砖窑', 'public'],
+    [28, 20, '龙王庙', 'temple'], [50, 22, '新小学', 'school'], [100, 35, '大坝', 'dam'], [50, 92, '庙坪山', 'hill'],
+    [-48, 148, '罐子村', 'village'], [-46, 184, '石圪节', 'village'],
+    [-44, 8, '孙玉厚家', 'home'], [-40, -16, '田福堂家', 'home'], [46, -8, '金波家', 'home'], [58, 12, '金俊武家', 'home']
+  ];
+  g.textAlign = 'center';
+  g.font = '8px "Songti SC", SimSun, serif';
+  for (const p of spots) {
+    const x = mmx(p[0]), y = mmz(p[1]);
+    if (p[3] === 'dam') {
+      g.strokeStyle = '#6b5a41'; g.lineWidth = 5;
+      g.beginPath(); g.moveTo(x, y - 8); g.lineTo(x, y + 8); g.stroke();
+    } else if (p[3] === 'temple') {
+      g.fillStyle = '#9a3b2c';
+      g.beginPath(); g.moveTo(x, y - 5); g.lineTo(x + 4, y + 2); g.lineTo(x - 4, y + 2); g.closePath(); g.fill();
+    } else if (p[3] === 'school') {
+      g.fillStyle = '#3f6a8a'; g.fillRect(x - 2.5, y - 2.5, 5, 5);
+    } else if (p[3] === 'hill') {
+      g.fillStyle = '#7d6b45';
+      g.beginPath(); g.moveTo(x, y - 4); g.lineTo(x + 5, y + 3); g.lineTo(x - 5, y + 3); g.closePath(); g.fill();
+    } else if (p[3] === 'village') {
+      g.fillStyle = '#7a4a2f'; g.beginPath(); g.arc(x, y, 3, 0, TAU); g.fill();
+    } else if (p[3] === 'home') {
+      g.fillStyle = '#8a5a3a'; g.fillRect(x - 2, y - 2, 4, 4);
+    } else {
+      g.fillStyle = '#9a3b2c'; g.fillRect(x - 2.5, y - 2.5, 5, 5);
+    }
+    g.lineWidth = 2;
+    g.strokeStyle = 'rgba(239,226,198,.92)';
+    g.strokeText(p[2], Math.max(14, Math.min(MAP_S - 14, x)), y + 11);
+    g.fillStyle = '#4a3a26';
+    g.fillText(p[2], Math.max(14, Math.min(MAP_S - 14, x)), y + 11);
+  }
+
+  // 区域名
+  g.font = '10px "Songti SC", SimSun, serif';
+  g.fillStyle = 'rgba(60,45,28,.78)';
+  g.strokeStyle = 'rgba(239,226,198,.8)'; g.lineWidth = 2.5;
+  for (const a of [[-44, -46, '田家圪崂'], [70, -46, '金家湾'], [30, 70, '庙坪'], [0, 2, '双水村']]) {
+    const x = mmx(a[0]), y = mmz(a[1]);
+    g.strokeText(a[2], x, y);
+    g.fillText(a[2], x, y);
+  }
+
+  // 县城方向
+  g.font = 'bold 9px sans-serif';
+  g.strokeStyle = 'rgba(239,226,198,.9)'; g.lineWidth = 2.5;
+  g.strokeText('原西县城 ▼', mmx(0), MAP_S - 6);
+  g.fillStyle = '#6b4a2f';
+  g.fillText('原西县城 ▼', mmx(0), MAP_S - 6);
+
+  g.fillStyle = 'rgba(60,45,28,.8)';
+  g.font = 'bold 11px serif';
+  g.fillText('N', MAP_S - 14, 18);
+  g.beginPath(); g.moveTo(MAP_S - 14, 28); g.lineTo(MAP_S - 18, 38); g.lineTo(MAP_S - 10, 38); g.closePath(); g.fill();
+
+  g.strokeStyle = '#b9a276'; g.lineWidth = 2;
+  g.strokeRect(1, 1, MAP_S - 2, MAP_S - 2);
+  mapBase = c;
+}
+
+function drawMinimap() {
+  const cv = document.getElementById('minimap');
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, MAP_S, MAP_S);
+  if (mapBase) g.drawImage(mapBase, 0, 0);
+  if (!started) return;
+
+  // 人物点
+  for (const n of npcs) {
+    const nx = mmx(n.x), ny = mmz(n.z);
+    if (nx < 2 || nx > MAP_S - 2 || ny < 2 || ny > MAP_S - 2) continue;
+    g.fillStyle = '#c98a4a';
+    g.beginPath(); g.arc(nx, ny, 1.7, 0, TAU); g.fill();
+  }
+  // 怪物点
+  for (const m of mobs) {
+    const mx = mmx(m.x), my = mmz(m.z);
+    if (mx < 2 || mx > MAP_S - 2 || my < 2 || my > MAP_S - 2) continue;
+    g.fillStyle = '#8a1f16';
+    g.beginPath(); g.arc(mx, my, 2.0, 0, TAU); g.fill();
+  }
+
+  const px = clamp(mmx(player.x), 7, MAP_S - 7);
+  const pz = clamp(mmz(player.z), 7, MAP_S - 7);
+
+  g.save();
+  g.translate(px, pz);
+  g.rotate(-cam.yaw);
+  g.fillStyle = 'rgba(217,178,94,.18)';
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(-14, -32); g.lineTo(14, -32); g.closePath(); g.fill();
+  g.restore();
+
+  const pulse = 10 + Math.sin(time * 3) * 2.2;
+  g.fillStyle = 'rgba(163,59,40,.16)';
+  g.beginPath(); g.arc(px, pz, pulse, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(246,234,210,.55)'; g.lineWidth = 1;
+  g.beginPath(); g.arc(px, pz, pulse, 0, TAU); g.stroke();
+
+  g.save();
+  g.translate(px, pz);
+  g.rotate(player.rot - Math.PI);
+  g.fillStyle = '#a33b28';
+  g.beginPath(); g.moveTo(0, -8); g.lineTo(6, 7); g.lineTo(-6, 7); g.closePath(); g.fill();
+  g.strokeStyle = '#f6ead2'; g.lineWidth = 1.4; g.stroke();
+  g.restore();
+}
+
+/* ---------------- 渲染 ---------------- */
+const I = m4identity();
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+  const w = Math.floor(window.innerWidth * dpr), h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+function render(dt) {
+  resize();
+  const aspect = canvas.width / canvas.height;
+  const proj = m4perspective(0.96, aspect, 0.1, 900);
+  const view = m4lookAt(cam.eye, cam.target, [0, 1, 0]);
+  const vp = m4mul(proj, view);
+  lastVP = vp; lastEye = cam.eye;
+
+  gl.clearColor(FOG[0], FOG[1], FOG[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // 天空
+  const dir = [cam.target[0] - cam.eye[0], cam.target[1] - cam.eye[1], cam.target[2] - cam.eye[2]];
+  const viewRot = m4lookAt([0, 0, 0], dir, [0, 1, 0]);
+  const skyVP = m4mul(proj, viewRot);
+  gl.useProgram(skyProg);
+  gl.uniformMatrix4fv(LS.uVP, false, skyVP);
+  gl.uniform3f(LS.uTop, SKY_TOP[0], SKY_TOP[1], SKY_TOP[2]);
+  gl.uniform3f(LS.uHor, SKY_HOR[0], SKY_HOR[1], SKY_HOR[2]);
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.bindBuffer(gl.ARRAY_BUFFER, skyMesh.buf);
+  gl.vertexAttribPointer(LS.aPos, 3, gl.FLOAT, false, 36, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, skyMesh.count);
+
+  // 主场景
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(L.uVP, false, vp);
+  gl.uniform3fv(L.uLight, SUN_DIR);
+  gl.uniform3fv(L.uAmb, AMB);
+  gl.uniform3fv(L.uSun, SUN_COL);
+  gl.uniform3fv(L.uFog, FOG);
+  gl.uniform1f(L.uFogN, FOG_NEAR);
+  gl.uniform1f(L.uFogF, FOG_FAR);
+  gl.uniform3fv(L.uEye, cam.eye);
+
+  drawMesh(worldMesh, I, false, 1);
+  drawMesh(terrainMesh, I, false, 1);
+  for (const c of clouds) {
+    drawMesh(cloudMesh, m4trs(c.x, c.y, c.z, 0, 0, 0, c.s, c.s * 0.42, c.s), false, 1);
+  }
+
+  if (bikeMesh) {
+    if (riding) {
+      drawMesh(bikeMesh, m4trs(player.x, player.y, player.z, 0, player.rot, 0, 1, 1, 1), false, 1);
+    } else {
+      const by = groundH(43, -4);
+      drawMesh(bikeMesh, m4trs(43, by, -4, 0, 1.25, 0, 1, 1, 1), false, 1);
+    }
+  }
+
+  drawPerson(player.model, player.x, player.y, player.z, player.rot);
+  for (const m of mobs) {
+    drawMesh(dogMesh, m4trs(m.x, m.y, m.z, 0, m.rot, 0, 1, 1, 1), false, 1);
+  }
+  if (!bball.active && !fly && !riding) {
+    const fx2 = Math.sin(player.rot), fz2 = Math.cos(player.rot);
+    const rx2 = Math.cos(player.rot), rz2 = -Math.sin(player.rot);
+    const hx = player.x + rx2 * 0.32 + fx2 * 0.12;
+    const hz = player.z + rz2 * 0.32 + fz2 * 0.12;
+    drawMesh(weapon === 1 ? swordMesh : gunMesh, m4trs(hx, player.y + 1.05, hz, 0, player.rot, 0, 1, 1, 1), false, 1);
+  }
+  if (bball.active && bball.ball) {
+    drawMesh(bballMesh, m4trs(bball.ball.x, bball.ball.y, bball.ball.z, bball.ball.spin || 0, 0, 0, 1, 1, 1), false, 1);
+  }
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    drawPerson(n.model, n.x, n.y, n.z, n.rot);
+  }
+
+  // 太阳
+  gl.depthMask(false);
+  gl.uniform1f(L.uUnlit, 1);
+  gl.uniform1f(L.uAlpha, 1);
+  if (SUN_DIR[1] > -0.06) {
+    const sunModel = m4trs(SUN_DIR[0] * 720, SUN_DIR[1] * 720, SUN_DIR[2] * 720, 0, 0, 0, 20, 20, 20);
+    drawMesh(sunMesh, sunModel, true, 1);
+  }
+
+  // 影子
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+  gl.uniform1f(L.uUnlit, 1);
+  gl.uniform1f(L.uAlpha, 0.16);
+  const baseY = player.y + 0.04;
+  drawMesh(shadowMesh, m4trs(player.x, baseY, player.z, 0, 0, 0, 0.72, 1, 0.72), true, 0.16);
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    drawMesh(shadowMesh, m4trs(n.x, n.y + 0.04, n.z, 0, 0, 0, 0.62, 1, 0.62), true, 0.15);
+  }
+  for (let i = 0; i < shadowSpots.length; i++) {
+    const sp = shadowSpots[i];
+    drawMesh(shadowMesh, m4trs(sp.x, terrainH(sp.x, sp.z) + 0.05, sp.z, 0, 0, 0, sp.rx, 1, sp.rz), true, sp.a);
+  }
+
+  // 水
+  gl.useProgram(waterProg);
+  gl.uniformMatrix4fv(LW.uVP, false, vp);
+  gl.uniform1f(LW.uTime, time);
+  gl.uniform3fv(LW.uEye, cam.eye);
+  gl.uniform3fv(LW.uFog, FOG);
+  gl.uniform1f(LW.uFogN, FOG_NEAR);
+  gl.uniform1f(LW.uFogF, FOG_FAR);
+  gl.bindBuffer(gl.ARRAY_BUFFER, waterMesh.buf);
+  gl.vertexAttribPointer(LW.aPos, 3, gl.FLOAT, false, 36, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, waterMesh.count);
+
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+
+  updateLabels();
+  drawMinimap();
+}
+
+/* ---------------- 主循环 ---------------- */
+let lastT = 0;
+function frame(now) {
+  if (!lastT) lastT = now;
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  time += dt;
+  if (started && !fly && !bball.active) updatePlayer(dt);
+  if (bball.active) updateBasket(dt);
+  if (fly) updateFly(dt);
+  updateNpcs(dt);
+  updateDayNight(dt);
+  updateClouds(dt);
+  if (!bball.active) updateCombat(dt);
+  updateCamera(dt);
+  updateHud();
+  render(dt);
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 启动 ---------------- */
+function toggleBike() {
+  if (!started || fly) return;
+  riding = !riding;
+  if (riding) {
+    cam.dist = 8.8;
+    hintText('骑上自行车 · Shift 快骑 · B 下车');
+  } else {
+    cam.dist = 7.6;
+    player.model.parts[0].rot[0] = 0;
+    hintText('下车了');
+  }
+}
+
+function hintText(msg) {
+  const h = document.getElementById('hint');
+  if (!h) return;
+  h.textContent = msg;
+  h.classList.add('on');
+  clearTimeout(hintText._t);
+  hintText._t = setTimeout(() => h.classList.remove('on'), 5000);
+}
+
+function toggleFly() {
+  if (!started) return;
+  fly = !fly;
+  const btn = document.getElementById('flyBtn');
+  if (fly) {
+    flyPos[0] = cam.eye[0];
+    flyPos[1] = Math.max(cam.eye[1], 10);
+    flyPos[2] = cam.eye[2];
+    flyYaw = cam.yaw;
+    flyPitch = 0.4;
+    btn.textContent = '返 回';
+    btn.classList.add('active');
+    hintText('飞天视角 · WASD 移动 · 空格升 / C 降 · Shift 加速 · F 返回');
+  } else {
+    btn.textContent = '飞 天';
+    btn.classList.remove('active');
+    cam.yaw = flyYaw;
+    cam.pitch = 0.22;
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    cam.eye[0] = player.x + Math.sin(cam.yaw) * cp * cam.dist;
+    cam.eye[1] = player.y + 1.35 + sp * cam.dist;
+    cam.eye[2] = player.z + Math.cos(cam.yaw) * cp * cam.dist;
+    cam.target = [player.x, player.y + 1.35, player.z];
+    hintText('回到地面');
+  }
+}
+
+function updateFly(dt) {
+  let fwd = 0, str = 0;
+  if (keys.KeyW || keys.ArrowUp) fwd += 1;
+  if (keys.KeyS || keys.ArrowDown) fwd -= 1;
+  if (keys.KeyD || keys.ArrowRight) str += 1;
+  if (keys.KeyA || keys.ArrowLeft) str -= 1;
+  if (joy.active) { fwd += -joy.y; str += joy.x; }
+  const speed = (keys.ShiftLeft || keys.ShiftRight ? 46 : 20) * dt;
+  const fx = -Math.sin(flyYaw), fz = -Math.cos(flyYaw);
+  const rx = Math.cos(flyYaw), rz = -Math.sin(flyYaw);
+  flyPos[0] += (fx * fwd + rx * str) * speed;
+  flyPos[2] += (fz * fwd + rz * str) * speed;
+  if (keys.Space) flyPos[1] += speed * 0.8;
+  if (keys.KeyC) flyPos[1] -= speed * 0.8;
+  flyPos[0] = clamp(flyPos[0], -200, 200);
+  flyPos[2] = clamp(flyPos[2], -220, 220);
+  flyPos[1] = clamp(flyPos[1], groundH(flyPos[0], flyPos[2]) + 1.6, 180);
+}
+
+function startGame() {
+  if (started) return;
+  started = true;
+  cam.yaw = -Math.PI / 2;
+  cam.pitch = 0.17;
+  cam.dist = 7.6;
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  cam.eye[0] = player.x + Math.sin(cam.yaw) * cp * cam.dist;
+  cam.eye[1] = player.y + 1.35 + sp * cam.dist;
+  cam.eye[2] = player.z + Math.cos(cam.yaw) * cp * cam.dist;
+  cam.target = [player.x, player.y + 1.35, player.z];
+  document.getElementById('start').classList.add('out');
+  document.getElementById('hud').classList.add('on');
+  document.getElementById('minimap').classList.add('on');
+  document.getElementById('flyBtn').classList.add('on');
+  document.getElementById('ballBtn').classList.add('on');
+  document.getElementById('dayBtn').classList.add('on');
+  document.getElementById('combat').classList.add('on');
+  document.getElementById('atkBtn').classList.add('on');
+  document.getElementById('hint').classList.add('on');
+  document.getElementById('musicBtn').classList.add('on');
+  startMusic();
+  setTimeout(() => document.getElementById('hint').classList.remove('on'), 9000);
+}
+
+function init() {
+  buildWorld();
+  worldMesh = upload(world);
+  terrainMesh = buildTerrainMesh();
+  waterMesh = buildWaterMesh();
+  skyMesh = buildSkyMesh();
+  cloudMesh = upload(buildCloudGeo());
+  initClouds();
+
+  const shg = new Geo(); shg.discXZ(0, 0, 0, 1, [0.05, 0.03, 0.02], 22); shadowMesh = upload(shg);
+  const sun = new Geo(); sun.sphere(0, 0, 0, 1, [1.0, 0.93, 0.74], 12, 8); sunMesh = upload(sun);
+  bikeMesh = upload(buildBikeGeo());
+  const bg = new Geo(); bg.sphere(0, 0, 0, 0.14, [0.86, 0.45, 0.12], 10, 6); bballMesh = upload(bg);
+  const dogG = new Geo();
+  const fur = [0.32, 0.28, 0.22], dfur = [0.2, 0.17, 0.13];
+  dogG.box(0, 0.45, 0, 0.42, 0.4, 0.95, fur);
+  dogG.box(0, 0.62, 0.62, 0.34, 0.34, 0.4, fur);
+  dogG.box(0, 0.55, 0.86, 0.22, 0.18, 0.22, dfur);
+  dogG.box(-0.1, 0.82, 0.6, 0.1, 0.14, 0.1, dfur);
+  dogG.box(0.1, 0.82, 0.6, 0.1, 0.14, 0.1, dfur);
+  for (const sx of [-0.15, 0.15]) for (const sz of [-0.32, 0.32]) dogG.box(sx, 0.18, sz, 0.1, 0.36, 0.12, dfur);
+  dogG.box(0, 0.6, -0.55, 0.08, 0.08, 0.35, fur);
+  dogMesh = upload(dogG);
+  const swg = new Geo();
+  swg.box(0, 0, 0.4, 0.06, 0.06, 0.75, [0.78, 0.78, 0.82]);
+  swg.box(0, 0, -0.02, 0.22, 0.04, 0.06, COL.wood);
+  swg.box(0, 0, -0.14, 0.06, 0.06, 0.2, COL.woodDark);
+  swordMesh = upload(swg);
+  const gng = new Geo();
+  gng.box(0, 0, 0.1, 0.1, 0.14, 0.5, [0.2, 0.2, 0.2]);
+  gng.box(0, 0.02, 0.42, 0.06, 0.06, 0.3, [0.12, 0.12, 0.12]);
+  gunMesh = upload(gng);
+
+  buildMinimapBase();
+  initActors();
+  initLabels();
+  bindInput();
+  document.getElementById('flyBtn').addEventListener('click', toggleFly);
+  document.getElementById('atkBtn').addEventListener('pointerdown', (e) => { e.preventDefault(); attack(); });
+  document.getElementById('dayBtn').addEventListener('click', () => { if (started) toggleDayCycle(); });
+  document.getElementById('musicBtn').addEventListener('click', () => { if (started) toggleMusic(); });
+  document.getElementById('ballBtn').addEventListener('click', () => {
+    if (started) startBasket();
+  });
+  const bbBtn = document.getElementById('bbBtn');
+  bbBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (bball.active && bball.phase === 'aim') bball.charging = true;
+  });
+  bbBtn.addEventListener('pointerup', (e) => {
+    e.preventDefault();
+    if (bball.active && bball.charging) shootBall();
+    else if (bball.active && bball.phase === 'over') exitBasket();
+  });
+  document.getElementById('enter').addEventListener('click', startGame);
+  document.getElementById('enter').addEventListener('touchstart', (e) => { e.preventDefault(); startGame(); }, { passive: false });
+
+  player.y = groundH(player.x, player.z);
+  cam.eye = [0, 40, 90];
+  cam.target = [0, 3, 8];
+  resize();
+  requestAnimationFrame(frame);
+
+  const q = new URLSearchParams(location.search);
+  if (q.has('px')) player.x = parseFloat(q.get('px'));
+  if (q.has('pz')) player.z = parseFloat(q.get('pz'));
+  player.y = groundH(player.x, player.z);
+  if (q.has('play')) {
+    startGame();
+    document.getElementById('start').style.display = 'none';
+    if (q.has('yaw')) cam.yaw = parseFloat(q.get('yaw'));
+    if (q.has('pitch')) cam.pitch = parseFloat(q.get('pitch'));
+    if (q.has('dist')) cam.dist = parseFloat(q.get('dist'));
+  }
+  if (q.has('fly')) {
+    if (!started) { startGame(); document.getElementById('start').style.display = 'none'; }
+    if (!fly) toggleFly();
+    flyPos[0] = q.has('fx') ? parseFloat(q.get('fx')) : 0;
+    flyPos[1] = q.has('fy') ? parseFloat(q.get('fy')) : 78;
+    flyPos[2] = q.has('fz') ? parseFloat(q.get('fz')) : 56;
+    flyYaw = q.has('fyaw') ? parseFloat(q.get('fyaw')) : 0;
+    flyPitch = q.has('fpitch') ? parseFloat(q.get('fpitch')) : -0.55;
+  }
+  if (q.has('ride')) {
+    if (!started) { startGame(); document.getElementById('start').style.display = 'none'; }
+    if (!riding) toggleBike();
+  }
+  if (q.has('ball')) {
+    if (!started) { startGame(); document.getElementById('start').style.display = 'none'; }
+    startBasket();
+  }
+  if (q.has('time')) dayTime = parseFloat(q.get('time'));
+  window.__game = { player: player, cam: cam, attack: attack, setWeapon: setWeapon, getMobs: () => mobs, getHp: () => playerHp, toggleDayCycle: toggleDayCycle, getNpcs: () => npcs, alertHelpers: alertHelpers, damagePlayer: damagePlayer, bball: bball, shootBall: shootBall };
+  if (q.has('mob')) {
+    if (!started) { startGame(); document.getElementById('start').style.display = 'none'; }
+    for (let i = 0; i < 3; i++) {
+      mobs.push({ x: player.x + 5 + i * 2, z: player.z + 3 + i * 2, y: groundH(player.x + 5 + i * 2, player.z + 3 + i * 2), hp: 60, rot: 0, cd: 0 });
+    }
+  }
+}
+
+init();
+
+})();
