@@ -3,6 +3,8 @@
 《平凡的世界》双水村的可自由行走 3D 场景。
 不是文字游戏，没有剧情弹窗；把你放进这个山沟里，自己走。
 
+在线试玩：https://lighthouse-ctrl.github.io/shuangshui3d/
+
 ## 打开
 
 双击 `index.html`，用 Chrome / Edge 打开。单文件、离线、无需服务器。
